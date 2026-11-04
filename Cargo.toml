@@ -1,0 +1,19 @@
+[workspace]
+members = ["psconnector", "psconnector-view", "psconnector-mcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+psconnector = { path = "psconnector" }
+anyhow = "1"
+base64 = "0.22"
+env_logger = "0.11"
+log = "0.4"
+png = "0.18.1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

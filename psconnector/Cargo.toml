@@ -1,0 +1,28 @@
+[package]
+name = "psconnector"
+description = "PS5 Remote Play client library: session, Takion, controller input, H.264 video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+base64.workspace = true
+cfb-mode = "0.8"
+hmac = "0.12"
+k256 = { version = "0.13", features = ["ecdh"] }
+log.workspace = true
+openh264 = "0.9.9"
+prost = "0.13"
+rand = "0.8"
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror = "2"
+tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+png.workspace = true

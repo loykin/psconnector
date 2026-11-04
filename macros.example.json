@@ -1,0 +1,13 @@
+[
+  {
+    "name": "Code Vein Mark of Honor farm",
+    "cmd": "../vendor/ps5rmtctl/.venv/bin/python -u farm.py 0",
+    "cwd": "~/Project/qewsim/macro",
+    "env": {"FARM_GOAL": "100000"}
+  },
+  {
+    "name": "Example: walk the menu 2 tiles and back",
+    "cmd": "python3 -u example_menu_walk.py 2",
+    "cwd": "~/Project/psconnector/python"
+  }
+]
