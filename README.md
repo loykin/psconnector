@@ -1,7 +1,5 @@
 # PsConnector
 
-English | [한국어](README.ko.md)
-
 A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS, receives the screen, and sends button and stick input.
 It is a connection layer that lets game macros and AI assistants operate a PS5.
 
