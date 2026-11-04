@@ -1,7 +1,7 @@
 //! Checks that the crypto matches pyremoteplay byte for byte.
 //! Expected values were produced by feeding the same inputs to pyremoteplay 0.7.6.
 
-use crate::gkcrypt::{StreamCipher, counter_add};
+use crate::gkcrypt::{Ecdh, StreamCipher, counter_add, sig};
 use crate::rpcrypt::{SessionCipher, aes_key, rp_nonce};
 
 const RP_NONCE: &str = "6b4f07f794c0e77dd30fdcc404215295";
@@ -63,4 +63,18 @@ fn counter_add_matches() {
     let mut iv = [0u8; 16];
     iv[..4].copy_from_slice(&[0xff, 0xff, 0xff, 0x01]);
     assert_eq!(hex(&counter_add(0x1ff, &iv)), CA);
+}
+
+#[test]
+fn ecdh_both_sides_agree() {
+    let (ours, console) = (Ecdh::new(), Ecdh::new());
+    // uncompressed SEC1 point: 0x04 || x || y
+    assert_eq!(ours.public_key.len(), 65);
+    assert_eq!(ours.public_key[0], 0x04);
+    // the console signs its public key with the handshake key we sent, and vice versa
+    let a = ours.shared_secret(&console.public_key, &sig(&ours.handshake_key, &console.public_key)).unwrap();
+    let b = console.shared_secret(&ours.public_key, &sig(&console.handshake_key, &ours.public_key)).unwrap();
+    assert_eq!(a.len(), 32);
+    assert_eq!(a, b);
+    assert!(ours.shared_secret(&console.public_key, &[0u8; 32]).is_err());
 }

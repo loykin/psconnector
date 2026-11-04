@@ -13,7 +13,8 @@ use aes_gcm::{AesGcm, aead::AeadInPlace, aes::cipher::consts::U16};
 use hmac::{Hmac, Mac};
 use k256::PublicKey;
 use k256::ecdh::EphemeralSecret;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::Generate;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
 
 const GMAC_REFRESH_IV: u64 = 44910;
@@ -132,7 +133,7 @@ pub struct Ecdh {
     pub public_sig: Vec<u8>,
 }
 
-fn sig(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+pub(crate) fn sig(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC key");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -141,8 +142,8 @@ fn sig(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
 impl Ecdh {
     pub fn new() -> Self {
         let handshake_key: [u8; 16] = rand::random();
-        let secret = EphemeralSecret::random(&mut rand::rngs::OsRng);
-        let public_key = secret.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let secret = EphemeralSecret::generate();
+        let public_key = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
         let public_sig = sig(&handshake_key, &public_key);
         Self { handshake_key, secret, public_key, public_sig }
     }
