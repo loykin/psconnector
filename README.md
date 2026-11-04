@@ -1,6 +1,6 @@
 # PsConnector
 
-A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS, receives the screen, and sends button and stick input.
+A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS or Windows, receives the screen, and sends button and stick input.
 It is a connection layer that lets game macros and AI assistants operate a PS5.
 
 > Unofficial tool, not affiliated with Sony Interactive Entertainment. PlayStation, PS5 and PS Remote Play are trademarks of Sony.
@@ -91,6 +91,7 @@ cargo run --release -p psconnector-view -- 192.168.1.20
 | `{"play":"recording.json"}` / `{"stop":true}` play and stop a recording | `ok` |
 | `{"status":true}` | `ok playing` / `ok idle` |
 | `{"osd":"text"}` show text in the top-left of the window | `ok` |
+| `{"ocr":[x,y,w,h],"scale":2}` read text in a region (macOS Vision) | `ok ["line", ...]` |
 | `{"standby":true}` rest mode | `ok` |
 | `{"macros":true}` / `{"macro_run":"name"}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
 
@@ -123,6 +124,7 @@ ps.tap('cross')
 ps.stick('left', 0, -1); ps.sleep(0.5); ps.stick('left', 0, 0)
 w, h, rgb = ps.frame()         # ps.frame_array(bgr=True) if numpy is installed
 ps.wait(lambda: ps.pixel(640, 360)[0] > 200, timeout=5)
+lines = ps.ocr(rel=(0.38, 0.63, 0.62, 0.75), scale=2)   # text in a region, as a list of lines
 ```
 
 See `python/example_menu_walk.py` for an example.
@@ -153,6 +155,20 @@ Add `--allow-input` at the end to allow input. By default only viewing the scree
 | `standby` / `wake` | Rest mode, wake-up | ✔ |
 
 For example: "Look at the screen and tell me how to beat this boss", "Run the Code Vein farm", "Open the equipment menu".
+
+## Download
+
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Windows (x64) are attached to each [GitHub release](https://github.com/loykin/psconnector/releases). Each archive holds `psconnector-view`, `psconnector-mcp`, `macros.example.json` and `python/psconnector.py`.
+
+On Windows, the `ocr` command is not supported yet (it uses macOS Vision); everything else works the same. Macros from the bar run through `cmd /C`.
+
+The binaries are not signed. Windows SmartScreen may warn on first run ("More info" → "Run anyway"). On macOS, clear the quarantine flag after extracting:
+
+```bash
+xattr -d com.apple.quarantine psconnector-view psconnector-mcp
+```
+
+CI (`.github/workflows/ci.yml`) runs rustfmt, clippy, build and tests on macOS and Windows, plus a RustSec dependency audit. Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag matching the workspace version in `Cargo.toml` is pushed on `master`.
 
 ## Build
 

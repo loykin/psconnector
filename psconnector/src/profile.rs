@@ -31,9 +31,9 @@ impl std::fmt::Debug for Registration {
     }
 }
 
+/// `~/.pyremoteplay/.profile.json` (`%USERPROFILE%` on Windows).
 pub fn default_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".pyremoteplay").join(".profile.json")
+    std::env::home_dir().unwrap_or_default().join(".pyremoteplay").join(".profile.json")
 }
 
 /// Finds the registration for `host_id` in the profile file.
