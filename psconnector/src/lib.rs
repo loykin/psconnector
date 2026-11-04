@@ -195,13 +195,25 @@ impl Client {
     pub async fn close(&self) {
         let _ = self.cmd.send(stream::Cmd::Stop);
         let task = self.stream_task.lock().unwrap().take();
-        if let Some(t) = task {
-            let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+        if let Some(mut t) = task {
+            match tokio::time::timeout(Duration::from_secs(2), &mut t).await {
+                Ok(_) => {}
+                Err(_) => {
+                    log::warn!("stream task did not stop in time; aborting it");
+                    t.abort();
+                }
+            }
         }
         let _ = self.ctrl.send(session::CtrlCmd::Close);
         let task = self.ctrl_task.lock().unwrap().take();
-        if let Some(t) = task {
-            let _ = tokio::time::timeout(Duration::from_secs(1), t).await;
+        if let Some(mut t) = task {
+            match tokio::time::timeout(Duration::from_secs(1), &mut t).await {
+                Ok(_) => {}
+                Err(_) => {
+                    log::warn!("control task did not stop in time; aborting it");
+                    t.abort();
+                }
+            }
         }
     }
 }

@@ -1,10 +1,16 @@
 """psconnector example: move n tiles right on the home screen game row, then back.
 
-Run it from the psconnector-view bar, or with psconnector-view running: `python3 example_menu_walk.py 3`.
+Run it from the psconnector-view bar, or with psconnector-view running: `python3 menu_walk.py 3`.
 """
+import os
 import sys
 
-from psconnector import PS
+try:
+    from psconnector import PS
+except ImportError:
+    # running from the psconnector repository or release folder: use its python/psconnector.py
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'python'))
+    from psconnector import PS
 
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 with PS() as ps:

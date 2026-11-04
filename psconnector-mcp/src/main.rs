@@ -28,7 +28,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 
 const INSTRUCTIONS: &str = "Tools to see a PS5 Remote Play screen and control it with a virtual controller.
-- Screen coordinates are in the original 1280x720 space (screenshot's region uses them too).
+- Screen coordinates are always in 1280x720 space (screenshot's region uses them), whatever the picture quality.
 - Button names: up down left right l1 r1 l2 r2 cross circle square triangle options share ps l3 r3 touchpad.
 - Sticks: which=left|right, x and y in -1.0..1.0 (up is negative). With duration, the stick is held that long and then centered.
 - Input is sent in order; psconnector-view encrypts and sends everything from one place. release_all releases everything at once.
@@ -172,6 +172,12 @@ struct TextArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct QualityArgs {
+    /// "low" (360p, for macros), "720p" or "1080p" (for playing). Omit to only report the current one.
+    quality: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RunArgs {
     /// Macro name (equal to, or part of, a name in the list)
     name: String,
@@ -251,7 +257,13 @@ impl Psconnector {
     #[tool(description = "Gets the current PS5 screen as a PNG image. Use region to zoom into part of it.")]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> Result<CallToolResult, McpError> {
         let (w, h, rgb) = tri!(self.port.frame().await);
-        let (ow, oh, out) = crop_scale(w, h, &rgb, a.region, a.width.unwrap_or(960) as usize);
+        // regions are given in 1280x720 space; the stream may be 360p or 1080p
+        let region = a.region.map(|[x, y, rw, rh]| {
+            let sx = |v: u32| (u64::from(v) * w as u64 / 1280) as u32;
+            let sy = |v: u32| (u64::from(v) * h as u64 / 720) as u32;
+            [sx(x), sy(y), sx(rw), sy(rh)]
+        });
+        let (ow, oh, out) = crop_scale(w, h, &rgb, region, a.width.unwrap_or(960) as usize);
         let png = tri!(png_bytes(ow, oh, &out));
         Ok(CallToolResult::success(vec![
             ContentBlock::image(B64.encode(png), "image/png"),
@@ -352,6 +364,14 @@ impl Psconnector {
     #[tool(description = "Macro run status and the last few lines of its output.")]
     async fn macro_status(&self, Parameters(a): Parameters<StatusArgs>) -> Result<CallToolResult, McpError> {
         let s = tri!(self.call(json!({"macro_status": true, "lines": a.lines.unwrap_or(10)})).await);
+        ok_text(s)
+    }
+
+    #[tool(
+        description = "Reports or changes the picture quality of psconnector-view. Changing it reconnects (no picture for a few seconds)."
+    )]
+    async fn quality(&self, Parameters(a): Parameters<QualityArgs>) -> Result<CallToolResult, McpError> {
+        let s = tri!(self.call(json!({"quality": a.quality.unwrap_or_default()})).await);
         ok_text(s)
     }
 

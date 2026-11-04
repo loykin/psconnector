@@ -2,13 +2,14 @@
 //!
 //! ```text
 //! cargo run --release -p psconnector-view -- [host] [--port 8650] [--macros FILE]
-//!     [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]
+//!     [--quality low|720p|1080p] [--bitrate KBPS] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]
 //! - A game controller connected to this computer (DualSense, ...) drives the PS5 directly (off with `--no-pad`).
 //! - The console's sound plays on the default output device (🔊 in the bar mutes it; `--mute`, `--no-audio`).
 //! ```
 //! - Command port (127.0.0.1:8650, one JSON object per line): the same commands as the Python `ps5view.py`
 //!   plus `frame` and `release_all`, so existing macros run unchanged. From Python, use `python/psconnector.py`.
-//! - Top bar: pick a macro from `~/.psconnector/macros.json` and ▶ Run / ■ Stop.
+//! - Top bar: pick a macro and ▶ Run / ■ Stop. Each folder with a `macro.json` in the `macros` folder next to
+//!   the program is a macro (`--macros PATH` reads other folders, or an older list file, instead).
 //!   Macros run as child processes and get the port via the `PSCONNECTOR_PORT` environment variable.
 //!   Stop sends SIGINT first (KeyboardInterrupt in Python) and kills the process if it is not gone in 3 s.
 //!   However a macro ends, all buttons are released and the sticks are centered.
@@ -21,6 +22,8 @@
 //! Macros: `{"macros":true}` `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name
 //! optional) `{"macro_stop":true}` (also cancels a schedule) `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
 //! `{"should_stop":true}` (reply `ok yes` once the time limit is up, else `ok no`)
+//! `{"quality":"low|720p|1080p"}` reconnect at that picture quality (`""` only reports it; reply `ok {JSON}`)
+//! OCR with `"rel":true` takes corners `[x0,y0,x1,y1]` as fractions of the frame.
 //! Replies are one line: `ok` / `ok playing` / `ok idle` / `err REASON`.
 //! Only `frame` is followed by raw RGB bytes after its `ok WIDTH HEIGHT BYTES` line. Press Q in the window to quit.
 
@@ -34,13 +37,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use eframe::egui;
-use psconnector::{Button, Client, Frame, Options};
+use psconnector::{Audio, Button, Client, Frame, Options};
+use quality::Quality;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod ocr;
 mod pad;
+mod quality;
 mod sound;
 
 const DEFAULT_PORT: u16 = 8650;
@@ -54,7 +59,17 @@ const FONT: &str = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf";
 const LOG_LINES: usize = 200;
 
 struct Shared {
-    client: Arc<Client>,
+    /// Current connection; replaced when the viewer reconnects (quality change)
+    client: std::sync::RwLock<Arc<Client>>,
+    host: String,
+    quality: Mutex<Quality>,
+    bitrate_kbps: Option<u32>,
+    use_audio: bool,
+    /// Where each connection's audio is forwarded to (None when sound is off)
+    audio_out: Option<std::sync::mpsc::Sender<Audio>>,
+    /// Set while reconnecting; shown in the window
+    reconnecting: Mutex<Option<String>>,
+    rt: tokio::runtime::Handle,
     runner: Arc<Mutex<Runner>>,
     osd: Mutex<String>,
     /// Name of the game controller connected to this computer, if any
@@ -71,12 +86,74 @@ struct Shared {
 }
 
 impl Shared {
+    fn client(&self) -> Arc<Client> {
+        self.client.read().unwrap().clone()
+    }
+
     fn release_all(&self) {
+        let c = self.client();
         for b in Button::ALL {
-            self.client.release(b);
+            c.release(b);
         }
-        self.client.stick(false, 0.0, 0.0);
-        self.client.stick(true, 0.0, 0.0);
+        c.stick(false, 0.0, 0.0);
+        c.stick(true, 0.0, 0.0);
+    }
+
+    fn options(&self, q: Quality) -> Options {
+        Options { audio: self.use_audio, stream: q.stream(self.bitrate_kbps), ..Options::default() }
+    }
+
+    /// Sends this connection's decoded audio on to the sound output.
+    fn attach_audio(&self, c: &Client) {
+        if let (Some(out), Some(rx)) = (self.audio_out.clone(), c.take_audio()) {
+            std::thread::spawn(move || {
+                while let Ok(a) = rx.recv() {
+                    if out.send(a).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Reconnects at another quality (no-op if already there).
+    fn set_quality(self: &Arc<Self>, q: Quality) -> Result<(), String> {
+        if *self.quality.lock().unwrap() == q {
+            return Ok(());
+        }
+        {
+            let mut r = self.reconnecting.lock().unwrap();
+            if r.as_deref().is_some_and(|n| n.starts_with("reconnecting")) {
+                return Err("already reconnecting".into());
+            }
+            *r = Some(format!("reconnecting at {}...", q.label()));
+        }
+        let sh = self.clone();
+        self.rt.spawn(async move {
+            sh.release_all();
+            let old_q = *sh.quality.lock().unwrap();
+            sh.client().close().await;
+            // the console needs a moment to drop the old session; connect() retries while it is busy
+            let result = match connect(&sh.host, sh.options(q)).await {
+                Ok(c) => Ok((c, q)),
+                Err(e) => {
+                    log::warn!("reconnect at {} failed: {e:#}; going back to {}", q.label(), old_q.label());
+                    connect(&sh.host, sh.options(old_q)).await.map(|c| (c, old_q))
+                }
+            };
+            match result {
+                Ok((c, got)) => {
+                    sh.attach_audio(&c);
+                    *sh.client.write().unwrap() = Arc::new(c);
+                    *sh.quality.lock().unwrap() = got;
+                    quality::save(got);
+                    log::info!("connected at {}", got.label());
+                    *sh.reconnecting.lock().unwrap() = None;
+                }
+                Err(e) => *sh.reconnecting.lock().unwrap() = Some(format!("reconnect failed: {e:#}")),
+            }
+        });
+        Ok(())
     }
 }
 
@@ -104,7 +181,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut host = None;
     let mut port = DEFAULT_PORT;
-    let mut macros_path = expand("~/.psconnector/macros.json");
+    let mut macro_sources: Vec<PathBuf> = Vec::new();
     let mut autorun: Option<String> = None;
     // --for / --after / --at for --run, in the same shape as the macro_run command
     let mut run_opts = serde_json::Map::new();
@@ -112,12 +189,16 @@ fn main() -> Result<()> {
     let mut use_pad = true;
     let mut use_audio = true;
     let mut start_muted = false;
+    let mut quality: Option<Quality> = None;
+    let mut bitrate_kbps: Option<u32> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => {
                 port = args.next().and_then(|p| p.parse().ok()).ok_or_else(|| anyhow!("missing value for --port"))?
             }
-            "--macros" => macros_path = expand(&args.next().ok_or_else(|| anyhow!("missing value for --macros"))?),
+            "--macros" => {
+                macro_sources.push(expand(&args.next().ok_or_else(|| anyhow!("missing value for --macros"))?))
+            }
             "--run" => autorun = Some(args.next().ok_or_else(|| anyhow!("missing value for --run"))?),
             "--for" => {
                 let min: f64 =
@@ -131,25 +212,46 @@ fn main() -> Result<()> {
             "--no-pad" => use_pad = false,
             "--no-audio" => use_audio = false,
             "--mute" => start_muted = true,
+            "--quality" => {
+                let v = args.next().unwrap_or_default();
+                quality = Some(Quality::parse(&v).ok_or_else(|| anyhow!("--quality must be low, 720p or 1080p"))?);
+            }
+            "--bitrate" => {
+                bitrate_kbps =
+                    Some(args.next().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("--bitrate needs kbit/s"))?)
+            }
             "--at" => run_at = Some(args.next().ok_or_else(|| anyhow!("--at needs HH:MM or +MINUTES"))?),
             _ => host = Some(a),
         }
     }
     let host = host
         .or_else(default_host)
-        .ok_or_else(|| anyhow!("usage: psconnector-view <PS5 address> [--port 8650] [--macros FILE] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]"))?;
+        .ok_or_else(|| anyhow!("usage: psconnector-view <PS5 address> [--port 8650] [--macros FILE] [--quality low|720p|1080p] [--bitrate KBPS] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]"))?;
     if autorun.is_none() && (!run_opts.is_empty() || run_at.is_some()) {
         bail!("--for, --after and --at go with --run MACRO");
     }
 
+    let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
     let rt = tokio::runtime::Runtime::new()?;
-    println!("connecting to the PS5...");
-    let client = Arc::new(rt.block_on(connect(&host, Options { audio: use_audio, ..Options::default() }))?);
+    println!("connecting to the PS5 at {}...", quality.label());
+    let opts = Options { audio: use_audio, stream: quality.stream(bitrate_kbps), ..Options::default() };
+    let client = Arc::new(rt.block_on(connect(&host, opts))?);
     let muted = Arc::new(AtomicBool::new(start_muted));
-    let sound = client.take_audio().is_some_and(|rx| sound::spawn(rx, muted.clone()));
-    let runner = Arc::new(Mutex::new(Runner::new(load_macros(&macros_path), macros_path.clone(), port)));
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+    let sound = use_audio && sound::spawn(audio_rx, muted.clone());
+    if macro_sources.is_empty() {
+        macro_sources = default_macro_sources();
+    }
+    let runner = Arc::new(Mutex::new(Runner::new(load_macros(&macro_sources), macro_sources, port)));
     let shared = Arc::new(Shared {
-        client: client.clone(),
+        client: std::sync::RwLock::new(client.clone()),
+        host: host.clone(),
+        quality: Mutex::new(quality),
+        bitrate_kbps,
+        use_audio,
+        audio_out: sound.then_some(audio_tx),
+        reconnecting: Mutex::new(None),
+        rt: rt.handle().clone(),
         runner: runner.clone(),
         osd: Mutex::new(String::new()),
         pad: Arc::new(Mutex::new(None)),
@@ -160,8 +262,10 @@ fn main() -> Result<()> {
         quit: AtomicBool::new(false),
         ctx: std::sync::OnceLock::new(),
     });
+    shared.attach_audio(&client);
     if use_pad {
-        pad::spawn(client.clone(), shared.pad.clone());
+        let sh = shared.clone();
+        pad::spawn(move || sh.client(), shared.pad.clone());
     }
     let sig = shared.clone();
     rt.spawn(async move {
@@ -181,7 +285,6 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default().with_title("PS5").with_inner_size([1280.0, 760.0]),
         ..Default::default()
     };
-    let frames = client.frames();
     let app_shared = shared.clone();
     let result = eframe::run_native(
         "psconnector-view",
@@ -189,12 +292,12 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             let _ = app_shared.ctx.set(cc.egui_ctx.clone());
-            Ok(Box::new(Viewer { shared: app_shared, frames, texture: None, shown: None, runner }))
+            Ok(Box::new(Viewer { shared: app_shared, texture: None, shown: None, runner, fps: FpsMeter::default() }))
         }),
     );
     shared.stop_play.store(true, Ordering::SeqCst);
     shared.release_all();
-    rt.block_on(client.close());
+    rt.block_on(shared.client().close());
     println!("closed");
     result.map_err(|e| anyhow!("window error: {e}"))
 }
@@ -213,7 +316,7 @@ fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
                     sh.release_all();
                     sh.stop_play.store(true, Ordering::SeqCst);
                     if ended.standby {
-                        sh.client.standby();
+                        sh.client().standby();
                     }
                 }
                 if sh.quit.load(Ordering::SeqCst)
@@ -225,7 +328,7 @@ fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
                     if quit_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
                         sh.runner.lock().unwrap().shutdown();
                         sh.release_all();
-                        rt.block_on(sh.client.close());
+                        rt.block_on(sh.client().close());
                         println!("closed");
                         std::process::exit(0);
                     }
@@ -250,19 +353,28 @@ async fn wait_for_quit_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// The console reports "another session connected" for a few seconds while it cleans up the previous
-/// session, so retry a few times.
+/// The console keeps reporting "another session connected" (and sometimes refuses the connection) for a
+/// while after the previous session ends — anywhere from a few seconds to about 40 — so keep retrying.
 async fn connect(host: &str, opts: Options) -> Result<Client> {
-    let mut k = 0;
+    let t0 = Instant::now();
     loop {
         match Client::connect(host, opts.clone()).await {
-            Err(psconnector::Error::Busy) if k < 7 => {
-                k += 1;
-                println!("previous session still active, retrying in 5 s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(c) => return Ok(c),
+            Err(e) if t0.elapsed() < Duration::from_secs(90) && is_transient(&e) => {
+                println!("previous session still active ({e}), retrying in 3 s");
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            r => return Ok(r?),
+            Err(e) => return Err(e.into()),
         }
+    }
+}
+
+fn is_transient(e: &psconnector::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, ConnectionReset};
+    match e {
+        psconnector::Error::Busy => true,
+        psconnector::Error::Io(io) => matches!(io.kind(), ConnectionRefused | ConnectionReset),
+        _ => false,
     }
 }
 
@@ -347,31 +459,97 @@ struct MacroDef {
     plan: Plan,
 }
 
-/// `[{"name": "...", "cmd": "python3 -u farm.py 0", "cwd": "~/...", "env": {"K": "V"}, "limit_min": 60, "after": "standby"}]`
-fn load_macros(path: &PathBuf) -> Result<Vec<MacroDef>, String> {
-    let text = std::fs::read_to_string(path).map_err(|_| format!("no macro list: {}", path.display()))?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("macro list JSON error: {e}"))?;
-    let list = v.as_array().ok_or("the macro list must be a JSON array")?;
-    list.iter()
-        .filter(|m| m["name"].is_string() && m["cmd"].is_string())
-        .map(|m| {
-            let name = m["name"].as_str().unwrap_or_default().to_string();
-            Ok(MacroDef {
-                cmd: m["cmd"].as_str().unwrap_or_default().to_string(),
-                cwd: m["cwd"].as_str().map(expand),
-                env: m["env"]
-                    .as_object()
-                    .map(|o| {
-                        o.iter()
-                            .map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                plan: Plan::default().merged(m).map_err(|e| format!("macro '{name}': {e}"))?,
-                name,
+/// Where macros are found when no `--macros` is given: the `macros` folder next to the program, so the whole
+/// folder can be moved (or unzipped anywhere on Windows) as one. A development build in `target/release/`
+/// uses the repository's `macros` folder instead.
+fn default_macro_sources() -> Vec<PathBuf> {
+    let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let Some(dir) = exe.as_deref().and_then(|p| p.parent()) else { return vec![PathBuf::from("macros")] };
+    let beside = dir.join("macros");
+    let in_cargo_target = dir.parent().is_some_and(|p| p.file_name().is_some_and(|n| n == "target"));
+    match dir.parent().and_then(|p| p.parent()) {
+        Some(repo) if in_cargo_target && !beside.is_dir() => vec![repo.join("macros")],
+        _ => vec![beside],
+    }
+}
+
+/// Reads macros from each source: a folder holds one macro per subfolder (each with a `macro.json`),
+/// a file is the older list form (`[{"name", "cmd", "cwd", ...}]`). Broken entries are skipped with a warning.
+///
+/// `macro.json`: `{"name": "...", "cmd": "python3 -u main.py", "env": {"K": "V"}, "limit_min": 60, "after": "standby"}`.
+/// Only `cmd` is required. The macro runs in its own folder (relative paths in `cmd` work), and the
+/// name defaults to the folder name, so a macro folder can be copied or moved as it is.
+fn load_macros(sources: &[PathBuf]) -> Result<Vec<MacroDef>, String> {
+    let mut list = Vec::new();
+    for src in sources {
+        if src.is_dir() {
+            let mut dirs: Vec<PathBuf> = std::fs::read_dir(src)
+                .map_err(|e| format!("cannot read {}: {e}", src.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.join("macro.json").is_file()) // follows symlinks to repositories
+                .collect();
+            dirs.sort();
+            for dir in dirs {
+                let file = dir.join("macro.json");
+                let parsed = std::fs::read_to_string(&file)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string()))
+                    .and_then(|v| {
+                        let folder = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        macro_def(&v, Some(&folder), Some(&dir))
+                    });
+                match parsed {
+                    Ok(m) => list.push(m),
+                    Err(e) => log::warn!("skipping {}: {e}", file.display()),
+                }
+            }
+        } else if src.is_file() {
+            let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+            let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: JSON error: {e}", src.display()))?;
+            let entries = v.as_array().ok_or_else(|| format!("{} must be a JSON array", src.display()))?;
+            for m in entries {
+                match macro_def(m, None, None) {
+                    Ok(m) => list.push(m),
+                    Err(e) => log::warn!("skipping an entry in {}: {e}", src.display()),
+                }
+            }
+        }
+    }
+    if list.is_empty() {
+        let at = sources.first().map(|p| p.display().to_string()).unwrap_or_default();
+        return Err(format!("no macros: add a folder with a macro.json to {at}"));
+    }
+    Ok(list)
+}
+
+/// One macro from its JSON. `folder` gives the default name and working folder (folder macros).
+fn macro_def(m: &Value, folder_name: Option<&str>, folder: Option<&PathBuf>) -> Result<MacroDef, String> {
+    let cmd = m["cmd"].as_str().ok_or("\"cmd\" is missing")?.to_string();
+    let name = m["name"].as_str().or(folder_name).ok_or("\"name\" is missing")?.to_string();
+    let cwd = match m["cwd"].as_str() {
+        Some(c) => {
+            let p = expand(c);
+            Some(match folder {
+                Some(f) if p.is_relative() => f.join(p),
+                _ => p,
             })
-        })
-        .collect()
+        }
+        None => folder.cloned(),
+    };
+    Ok(MacroDef {
+        cmd,
+        cwd,
+        env: m["env"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        plan: Plan::default().merged(m).map_err(|e| format!("macro '{name}': {e}"))?,
+        name,
+    })
 }
 
 /// Next local time matching `HH:MM` (today or tomorrow), or `+MIN` minutes from now.
@@ -427,7 +605,8 @@ struct Ended {
 
 struct Runner {
     macros: Result<Vec<MacroDef>, String>,
-    path: PathBuf,
+    /// Macro folders and list files, re-read by Reload list
+    sources: Vec<PathBuf>,
     port: u16,
     selected: usize,
     /// Limit and after-action set in the bar for the next run
@@ -441,10 +620,10 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(macros: Result<Vec<MacroDef>, String>, path: PathBuf, port: u16) -> Self {
+    fn new(macros: Result<Vec<MacroDef>, String>, sources: Vec<PathBuf>, port: u16) -> Self {
         let mut r = Self {
             macros,
-            path,
+            sources,
             port,
             selected: 0,
             plan: Plan::default(),
@@ -470,7 +649,7 @@ impl Runner {
 
     fn reload(&mut self) {
         if self.running.is_none() && self.scheduled.is_none() {
-            self.macros = load_macros(&self.path);
+            self.macros = load_macros(&self.sources);
             self.select(0);
         }
     }
@@ -753,10 +932,30 @@ fn interrupt(child: &mut Child) {
 
 struct Viewer {
     shared: Arc<Shared>,
-    frames: tokio::sync::watch::Receiver<Option<Arc<Frame>>>,
     texture: Option<egui::TextureHandle>,
     shown: Option<Arc<Frame>>,
     runner: Arc<Mutex<Runner>>,
+    fps: FpsMeter,
+}
+
+/// Frames shown per second, over the last second.
+#[derive(Default)]
+struct FpsMeter {
+    since: Option<Instant>,
+    count: u32,
+    fps: u32,
+}
+
+impl FpsMeter {
+    fn frame(&mut self) {
+        self.count += 1;
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= Duration::from_secs(1) {
+            self.fps = self.count;
+            self.count = 0;
+            self.since = Some(Instant::now());
+        }
+    }
 }
 
 impl Viewer {
@@ -816,7 +1015,7 @@ impl Viewer {
                 if ui.add_enabled(!names.is_empty(), egui::Button::new("▶ Run")).clicked() {
                     r.start();
                 }
-                ui.add(egui::TextEdit::singleline(&mut r.at_text).hint_text("HH:MM").desired_width(48.0))
+                ui.add(egui::TextEdit::singleline(&mut r.at_text).hint_text("HH:MM").desired_width(60.0))
                     .on_hover_text("Start time: HH:MM (today, or tomorrow if already past) or +MINUTES");
                 if ui
                     .add_enabled(!names.is_empty() && !r.at_text.trim().is_empty(), egui::Button::new("⏰ Schedule"))
@@ -861,7 +1060,7 @@ impl Viewer {
                 if ui.button("Rest mode").on_hover_text("Put the PS5 into rest mode (this also disconnects)").clicked()
                 {
                     r.stop();
-                    self.shared.client.standby();
+                    self.shared.client().standby();
                 }
                 if self.shared.sound {
                     let muted = self.shared.muted.load(Ordering::Relaxed);
@@ -869,6 +1068,29 @@ impl Viewer {
                     {
                         self.shared.muted.store(!muted, Ordering::Relaxed);
                     }
+                }
+                let current = *self.shared.quality.lock().unwrap();
+                let mut chosen = current;
+                let busy =
+                    self.shared.reconnecting.lock().unwrap().as_deref().is_some_and(|n| n.starts_with("reconnecting"));
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("quality")
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            for q in Quality::ALL {
+                                ui.selectable_value(&mut chosen, q, q.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Picture quality. Changing it reconnects (a few seconds). Remembered for next time.",
+                        );
+                });
+                if chosen != current {
+                    let _ = self.shared.set_quality(chosen);
+                }
+                if let Some(f) = &self.shown {
+                    ui.label(egui::RichText::new(format!("{}x{} {} fps", f.width, f.height, self.fps.fps)).weak());
                 }
                 let pad = self.shared.pad.lock().unwrap().clone();
                 match pad {
@@ -891,7 +1113,7 @@ impl eframe::App for Viewer {
 
         egui::Panel::top("bar").show(ui, |ui| self.bar(ui));
 
-        let latest = self.frames.borrow().clone();
+        let latest = self.shared.client().frame();
         if let Some(f) = latest
             && !self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f))
         {
@@ -901,6 +1123,7 @@ impl eframe::App for Viewer {
                 None => self.texture = Some(ctx.load_texture("ps5", img, egui::TextureOptions::LINEAR)),
             }
             self.shown = Some(f);
+            self.fps.frame();
         }
         // draw into the remaining area at 16:9
         let area = ui.available_rect_before_wrap();
@@ -921,8 +1144,11 @@ impl eframe::App for Viewer {
             );
         }
         let mut text = self.shared.osd.lock().unwrap().clone();
-        if !self.shared.client.is_ready() {
-            text = format!("disconnected: {:?}\n{text}", self.shared.client.phase());
+        let note = self.shared.reconnecting.lock().unwrap().clone();
+        if let Some(note) = note {
+            text = format!("{note}\n{text}");
+        } else if !self.shared.client().is_ready() {
+            text = format!("disconnected: {:?}\n{text}", self.shared.client().phase());
         }
         if !text.is_empty() {
             let font = egui::FontId::proportional(20.0);
@@ -974,7 +1200,7 @@ fn button(name: &str) -> Result<Button> {
 async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
     let ok = || Ok(Reply::Text("ok".into()));
     let m: Value = serde_json::from_str(line).context("not JSON")?;
-    let c = &sh.client;
+    let c = &sh.client();
     if let Some(name) = m["button"].as_str() {
         let b = button(name)?;
         match m["action"].as_str().unwrap_or("tap") {
@@ -1000,10 +1226,20 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v.max(0.0) as u32).collect())
             .unwrap_or_default();
-        let region = match r.as_slice() {
-            [x, y, w, h] => [*x, *y, *w, *h],
-            [] => [0, 0, f.width as u32, f.height as u32],
-            _ => bail!("ocr region must be [x, y, w, h]"),
+        let region = if m["rel"].as_bool() == Some(true) {
+            // "rel": corners [x0, y0, x1, y1] as fractions of the frame, so the region does not depend on quality
+            let v: Vec<f64> =
+                region.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+            let [x0, y0, x1, y1] = v.as_slice() else { bail!("ocr with rel needs [x0, y0, x1, y1] fractions") };
+            let px = |v: f64, size: usize| (v.clamp(0.0, 1.0) * size as f64) as u32;
+            let (x0, y0, x1, y1) = (px(*x0, f.width), px(*y0, f.height), px(*x1, f.width), px(*y1, f.height));
+            [x0, y0, x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1)]
+        } else {
+            match r.as_slice() {
+                [x, y, w, h] => [*x, *y, *w, *h],
+                [] => [0, 0, f.width as u32, f.height as u32],
+                _ => bail!("ocr region must be [x, y, w, h]"),
+            }
         };
         let scale = m["scale"].as_f64().unwrap_or(1.0) as f32;
         let lines = tokio::task::spawn_blocking(move || {
@@ -1053,6 +1289,22 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         // optional "limit_min", "after": "none|standby", "at": "HH:MM|+MIN"
         let msg = sh.runner.lock().unwrap().run_named(name, &m, m["at"].as_str()).map_err(|e| anyhow!(e))?;
         return Ok(Reply::Text(format!("ok {msg}")));
+    } else if let Some(q) = m["quality"].as_str() {
+        // {"quality": "low|720p|1080p"} reconnects at that quality; {"quality": ""} just reports it
+        if !q.is_empty() {
+            let q = Quality::parse(q).ok_or_else(|| anyhow!("quality must be low, 720p or 1080p"))?;
+            sh.set_quality(q).map_err(|e| anyhow!(e))?;
+        }
+        let f = c.frame();
+        return Ok(Reply::Text(format!(
+            "ok {}",
+            serde_json::json!({
+                "quality": sh.quality.lock().unwrap().name(),
+                "reconnecting": sh.reconnecting.lock().unwrap().clone(),
+                "width": f.as_ref().map(|f| f.width),
+                "height": f.as_ref().map(|f| f.height),
+            })
+        )));
     } else if m.get("should_stop").is_some() {
         let yes = sh.runner.lock().unwrap().should_stop();
         return Ok(Reply::Text(if yes { "ok yes" } else { "ok no" }.into()));
@@ -1069,7 +1321,7 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
 
 /// Plays a recording: `[{"t":secs,"b":button,"a":"press|release"} or {"t":secs,"s":"left|right","x":..,"y":..}]`
 async fn play(events: Vec<Value>, sh: Arc<Shared>) {
-    let c = &sh.client;
+    let c = sh.client();
     let t0 = tokio::time::Instant::now();
     let mut held: HashSet<Button> = HashSet::new();
     for ev in events {
@@ -1131,7 +1383,7 @@ mod tests {
             env: Vec::new(),
             plan: Plan::default().merged(&serde_json::json!({"limit_min": 5, "after": after})).unwrap(),
         }];
-        Runner::new(Ok(list), PathBuf::new(), 0)
+        Runner::new(Ok(list), Vec::new(), 0)
     }
 
     fn wait_end(r: &mut Runner) -> Ended {
@@ -1143,6 +1395,29 @@ mod tests {
             assert!(t0.elapsed() < Duration::from_secs(10), "macro did not end");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn macros_from_folders() {
+        let root = std::env::temp_dir().join(format!("psconnector-macros-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, json) in [
+            ("b-farm", r#"{"cmd": ".venv/bin/python -u farm.py", "limit_min": 30, "after": "standby"}"#),
+            ("a-walk", r#"{"name": "Menu walk", "cmd": "python3 walk.py", "cwd": "sub"}"#),
+            ("broken", r#"{"name": "no cmd"}"#),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("macro.json"), json).unwrap();
+        }
+        std::fs::create_dir_all(root.join("not-a-macro")).unwrap();
+        let list = load_macros(std::slice::from_ref(&root)).unwrap();
+        let names: Vec<_> = list.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["Menu walk", "b-farm"], "sorted by folder, name defaults to the folder");
+        assert_eq!(list[0].cwd.as_deref(), Some(root.join("a-walk").join("sub").as_path()));
+        assert_eq!(list[1].cwd.as_deref(), Some(root.join("b-farm").as_path()));
+        assert_eq!((list[1].plan.limit_min, list[1].plan.after), (30, After::Standby));
+        assert!(load_macros(&[root.join("missing")]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

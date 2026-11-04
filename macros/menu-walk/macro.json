@@ -1,0 +1,5 @@
+{
+  "name": "Example: walk the menu 2 tiles and back",
+  "cmd": "python3 -u menu_walk.py 2",
+  "limit_min": 1
+}

@@ -35,7 +35,6 @@ class PS:
         port = int(port or os.environ.get('PSCONNECTOR_PORT', 8650))
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._r = self._sock.makefile('rb')
-        self._size = None
 
     # ------------------------------------------------------------ low level
     def call(self, **msg):
@@ -106,18 +105,43 @@ class PS:
         scale enlarges the crop before reading; 1.5-3 helps with small text.
         """
         if rel is not None:
-            x0, y0, x1, y1 = rel
-            w, h = self.size()
-            region = [int(w * x0), int(h * y0), int(w * (x1 - x0)), int(h * (y1 - y0))]
-        line = self.call(ocr=list(region or []), scale=float(scale))
+            # fractions go to psconnector-view as they are, so they hold at any picture quality
+            line = self.call(ocr=[float(v) for v in rel], rel=True, scale=float(scale))
+        else:
+            line = self.call(ocr=list(region or []), scale=float(scale))
         return json.loads(line[2:].strip() or '[]')
 
     def size(self):
-        """(width, height) of the stream, cached after the first call."""
-        if self._size is None:
-            w, h, _ = self.frame()
-            self._size = (w, h)
-        return self._size
+        """(width, height) of the stream right now (it changes when the picture quality changes)."""
+        info = self.quality_info()
+        if info.get('width'):
+            return info['width'], info['height']
+        w, h, _ = self.frame()
+        return w, h
+
+    def quality_info(self):
+        """{'quality': 'low|720p|1080p', 'width', 'height', 'reconnecting'}. Empty dict on an older view."""
+        try:
+            return json.loads(self.call(quality='')[2:].strip() or '{}')
+        except PSError:
+            return {}
+
+    def set_quality(self, quality):
+        """Reconnects psconnector-view at 'low' (360p, light), '720p' or '1080p'. Takes a few seconds,
+        during which there is no picture; use wait_ready() after it."""
+        self.call(quality=str(quality))
+
+    def wait_ready(self, timeout=60):
+        """Waits until a quality change has finished. Returns True when connected again."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            note = self.quality_info().get('reconnecting')
+            if not note:
+                return True
+            if note.startswith('reconnect failed'):
+                raise PSError(note)
+            time.sleep(0.5)
+        return False
 
     def snap(self, path):
         """Saves the current frame as PNG."""

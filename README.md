@@ -3,6 +3,8 @@
 A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS or Windows, receives the screen and sound, and sends button and stick input.
 It is a connection layer that lets game macros and AI assistants operate a PS5.
 
+![psconnector-view: the PS5 screen with the macro bar on top](docs/viewer.jpg)
+
 > Unofficial tool, not affiliated with Sony Interactive Entertainment. PlayStation, PS5 and PS Remote Play are trademarks of Sony.
 
 | Crate | Kind | Purpose |
@@ -24,7 +26,7 @@ It is a connection layer that lets game macros and AI assistants operate a PS5.
 | Stick input (state re-sent every 200 ms) | done (verified with analog recording playback in Code Vein) |
 | Rest mode | done |
 | Local game controller (DualSense, ...) in psconnector-view | done (gilrs) |
-| Video (H.264 → RGB, 720p) | done (openh264, about 40 fps for the first 30 frames). Frames with missing units are dropped and a key frame is requested. No FEC recovery yet |
+| Video (H.264 → RGB, 360p / 720p / 1080p) | done (openh264 in software, about 58 fps at 1080p on Apple Silicon). Frames with missing units are dropped and a key frame is requested. No FEC recovery yet |
 | Audio (Opus → PCM) | done (pure-Rust Opus decoder; lost packets are filled from the copies in the next ones, then by concealment) |
 | PSN login, PIN registration | not yet (reads the registration saved by pyremoteplay) |
 
@@ -94,13 +96,24 @@ cargo run --release -p psconnector-view -- 192.168.1.20
 | `{"play":"recording.json"}` / `{"stop":true}` play and stop a recording | `ok` |
 | `{"status":true}` | `ok playing` / `ok idle` |
 | `{"osd":"text"}` show text in the top-left of the window | `ok` |
-| `{"ocr":[x,y,w,h],"scale":2}` read text in a region (macOS Vision) | `ok ["line", ...]` |
+| `{"ocr":[x,y,w,h],"scale":2}` read text in a region (macOS Vision); with `"rel":true` the region is `[x0,y0,x1,y1]` fractions | `ok ["line", ...]` |
 | `{"standby":true}` rest mode | `ok` |
 | `{"macros":true}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
 | `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name optional) | `ok started` / `ok scheduled for …` |
 | `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
+| `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
 
 A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.
+
+**Picture quality** is picked in the bar or with `--quality low|720p|1080p` (`--bitrate KBPS` to override the bit rate):
+
+| Preset | Stream | Use |
+|---|---|---|
+| `low` | 640x360, 30 fps, 2 Mbit/s | macros (screen checks, OCR), lightest |
+| `720p` | 1280x720, 60 fps, 10 Mbit/s | default |
+| `1080p` | 1920x1080, 60 fps, 15 Mbit/s | playing yourself |
+
+The resolution is agreed when connecting, so changing it in the bar reconnects. The console takes anywhere from a few seconds to about 40 to release the old session, so expect a short wait without a picture. The choice is remembered in `~/.psconnector/settings.json`. Macros keep working across a change: OCR with `rel=` fractions and MCP screenshot regions (always in 1280x720 space) do not depend on the resolution.
 
 The PS5's sound plays on the computer's default output device, kept within about 0.1 s of the picture. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
 
@@ -108,12 +121,19 @@ Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed
 
 ### Macro bar
 
-Pick a macro in the bar at the top of the window and press **▶ Run / ■ Stop**. The list lives in `~/.psconnector/macros.json` (see `macros.example.json`).
+Pick a macro in the bar at the top of the window and press **▶ Run / ■ Stop**.
+
+**Every folder with a `macro.json` in the `macros` folder next to `psconnector-view` is a macro.** To add one, put its folder there (or link a whole repository) and press **Reload list**. The release archives already have `macros/` beside the program, so the whole folder can be unzipped or moved anywhere, on Windows too. A development build (`target/release/`) reads the repository's `macros/` folder, where your own macros are ignored by git.
+
+```bash
+ln -s ~/Project/codevein-macro macros/codevein
+```
 
 ```json
-[{"name": "Code Vein farm", "cmd": "uv run python -u farm.py", "cwd": "~/Project/codevein-macro",
-  "env": {"FARM_GOAL": "400"}, "limit_min": 0, "after": "standby"}]
+{"name": "Code Vein farm", "cmd": ".venv/bin/python -u farm.py", "env": {"FARM_GOAL": "400"}, "limit_min": 0, "after": "standby"}
 ```
+
+Only `cmd` is required. The macro runs in its own folder, so relative paths work and a macro folder can be moved as it is; the name defaults to the folder name. See [macros/README.md](macros/README.md) for every field and [macros/menu-walk](macros/menu-walk) for an example. `--macros PATH` reads other macro folders instead (repeatable; an older list file of `[{"name", "cmd", "cwd"}]` also works).
 
 - Macros run as child processes. The port is passed in the `PSCONNECTOR_PORT` environment variable.
 - Stop sends SIGINT first (KeyboardInterrupt in Python) and kills the process if it has not exited after 3 seconds.
@@ -150,9 +170,10 @@ w, h, rgb = ps.frame()         # ps.frame_array(bgr=True) if numpy is installed
 ps.wait(lambda: ps.pixel(640, 360)[0] > 200, timeout=5)
 lines = ps.ocr(rel=(0.38, 0.63, 0.62, 0.75), scale=2)   # text in a region, as a list of lines
 if ps.should_stop(): ...       # time limit from the bar reached: finish up and exit
+ps.set_quality('low'); ps.wait_ready()   # lighter stream while a macro runs
 ```
 
-See `python/example_menu_walk.py` for an example.
+See [macros/menu-walk/menu_walk.py](macros/menu-walk/menu_walk.py) for an example.
 
 ## AI integration (MCP server `psconnector-mcp`)
 
@@ -177,13 +198,14 @@ Add `--allow-input` at the end to allow input. By default only viewing the scree
 | `release_all` | Release every button | |
 | `tap` / `taps` / `press` / `release` / `stick` | Controller input | ✔ |
 | `macro_run` | Run a macro, optionally with a time limit, rest mode afterwards, or a start time | ✔ |
+| `quality` | Report or change the picture quality | |
 | `standby` / `wake` | Rest mode, wake-up | ✔ |
 
 For example: "Look at the screen and tell me how to beat this boss", "Run the Code Vein farm", "Open the equipment menu".
 
 ## Download
 
-Prebuilt binaries for macOS (Apple Silicon and Intel) and Windows (x64) are attached to each [GitHub release](https://github.com/loykin/psconnector/releases). Each archive holds `psconnector-view`, `psconnector-mcp`, `macros.example.json` and `python/psconnector.py`.
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Windows (x64) are attached to each [GitHub release](https://github.com/loykin/psconnector/releases). Each archive holds `psconnector-view`, `psconnector-mcp`, the example `macros/` folder and `python/psconnector.py`.
 
 On Windows, the `ocr` command is not supported yet (it uses macOS Vision); everything else works the same. Macros from the bar run through `cmd /C`.
 
