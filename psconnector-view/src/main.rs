@@ -1,7 +1,10 @@
 //! psconnector-view: PS5 screen window + control command port + macro runner.
 //!
 //! ```text
-//! cargo run --release -p psconnector-view -- [host] [--port 8650] [--macros FILE] [--run MACRO]
+//! cargo run --release -p psconnector-view -- [host] [--port 8650] [--macros FILE]
+//!     [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]
+//! - A game controller connected to this computer (DualSense, ...) drives the PS5 directly (off with `--no-pad`).
+//! - The console's sound plays on the default output device (🔊 in the bar mutes it; `--mute`, `--no-audio`).
 //! ```
 //! - Command port (127.0.0.1:8650, one JSON object per line): the same commands as the Python `ps5view.py`
 //!   plus `frame` and `release_all`, so existing macros run unchanged. From Python, use `python/psconnector.py`.
@@ -9,11 +12,15 @@
 //!   Macros run as child processes and get the port via the `PSCONNECTOR_PORT` environment variable.
 //!   Stop sends SIGINT first (KeyboardInterrupt in Python) and kills the process if it is not gone in 3 s.
 //!   However a macro ends, all buttons are released and the sticks are centered.
+//!   Each run can have a time limit and an after-action (rest mode), and can be scheduled for a start time.
+//!   At the limit, a macro that polls `should_stop` gets 2 minutes to finish; others are stopped right away.
 //!
 //! Commands: `{"button":"cross","action":"tap|press|release","hold":0.08}` `{"stick":"left","x":0,"y":-1}`
 //! `{"release_all":true}` `{"snap":"path.png"}` `{"frame":true}` `{"play":"recording.json"}` `{"stop":true}`
 //! `{"status":true}` `{"osd":"text"}` `{"standby":true}` `{"ocr":[x,y,w,h],"scale":2}` (reply `ok ["line", ...]`)
-//! Macros: `{"macros":true}` `{"macro_run":"name"}` `{"macro_stop":true}` `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
+//! Macros: `{"macros":true}` `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name
+//! optional) `{"macro_stop":true}` (also cancels a schedule) `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
+//! `{"should_stop":true}` (reply `ok yes` once the time limit is up, else `ok no`)
 //! Replies are one line: `ok` / `ok playing` / `ok idle` / `err REASON`.
 //! Only `frame` is followed by raw RGB bytes after its `ok WIDTH HEIGHT BYTES` line. Press Q in the window to quit.
 
@@ -23,7 +30,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use eframe::egui;
@@ -33,6 +40,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod ocr;
+mod pad;
+mod sound;
 
 const DEFAULT_PORT: u16 = 8650;
 /// System font with Korean glyphs (falls back to egui's default font if missing)
@@ -48,10 +57,17 @@ struct Shared {
     client: Arc<Client>,
     runner: Arc<Mutex<Runner>>,
     osd: Mutex<String>,
+    /// Name of the game controller connected to this computer, if any
+    pad: Arc<Mutex<Option<String>>>,
+    /// Sound is playing (false with --no-audio or without an output device)
+    sound: bool,
+    muted: Arc<AtomicBool>,
     playing: AtomicBool,
     stop_play: AtomicBool,
     /// On Ctrl+C or SIGTERM, close the window and end the session cleanly
     quit: AtomicBool,
+    /// The window's egui context, to wake it up from other threads
+    ctx: std::sync::OnceLock<egui::Context>,
 }
 
 impl Shared {
@@ -90,6 +106,12 @@ fn main() -> Result<()> {
     let mut port = DEFAULT_PORT;
     let mut macros_path = expand("~/.psconnector/macros.json");
     let mut autorun: Option<String> = None;
+    // --for / --after / --at for --run, in the same shape as the macro_run command
+    let mut run_opts = serde_json::Map::new();
+    let mut run_at: Option<String> = None;
+    let mut use_pad = true;
+    let mut use_audio = true;
+    let mut start_muted = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => {
@@ -97,25 +119,50 @@ fn main() -> Result<()> {
             }
             "--macros" => macros_path = expand(&args.next().ok_or_else(|| anyhow!("missing value for --macros"))?),
             "--run" => autorun = Some(args.next().ok_or_else(|| anyhow!("missing value for --run"))?),
+            "--for" => {
+                let min: f64 =
+                    args.next().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("--for needs minutes"))?;
+                run_opts.insert("limit_min".into(), min.into());
+            }
+            "--after" => {
+                run_opts
+                    .insert("after".into(), args.next().ok_or_else(|| anyhow!("--after needs none|standby"))?.into());
+            }
+            "--no-pad" => use_pad = false,
+            "--no-audio" => use_audio = false,
+            "--mute" => start_muted = true,
+            "--at" => run_at = Some(args.next().ok_or_else(|| anyhow!("--at needs HH:MM or +MINUTES"))?),
             _ => host = Some(a),
         }
     }
     let host = host
         .or_else(default_host)
-        .ok_or_else(|| anyhow!("usage: psconnector-view <PS5 address> [--port 8650] [--macros FILE] [--run MACRO]"))?;
+        .ok_or_else(|| anyhow!("usage: psconnector-view <PS5 address> [--port 8650] [--macros FILE] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]"))?;
+    if autorun.is_none() && (!run_opts.is_empty() || run_at.is_some()) {
+        bail!("--for, --after and --at go with --run MACRO");
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     println!("connecting to the PS5...");
-    let client = Arc::new(rt.block_on(connect(&host))?);
+    let client = Arc::new(rt.block_on(connect(&host, Options { audio: use_audio, ..Options::default() }))?);
+    let muted = Arc::new(AtomicBool::new(start_muted));
+    let sound = client.take_audio().is_some_and(|rx| sound::spawn(rx, muted.clone()));
     let runner = Arc::new(Mutex::new(Runner::new(load_macros(&macros_path), macros_path.clone(), port)));
     let shared = Arc::new(Shared {
         client: client.clone(),
         runner: runner.clone(),
         osd: Mutex::new(String::new()),
+        pad: Arc::new(Mutex::new(None)),
+        sound,
+        muted,
         playing: AtomicBool::new(false),
         stop_play: AtomicBool::new(false),
         quit: AtomicBool::new(false),
+        ctx: std::sync::OnceLock::new(),
     });
+    if use_pad {
+        pad::spawn(client.clone(), shared.pad.clone());
+    }
     let sig = shared.clone();
     rt.spawn(async move {
         wait_for_quit_signal().await;
@@ -123,10 +170,12 @@ fn main() -> Result<()> {
     });
     let listener = rt.block_on(TcpListener::bind(("127.0.0.1", port))).context("cannot open the command port")?;
     rt.spawn(serve(listener, shared.clone()));
+    spawn_supervisor(shared.clone(), rt.handle().clone());
     println!("connected. command port {port}. press Q in the window to quit");
 
     if let Some(name) = autorun {
-        runner.lock().unwrap().start_named(&name).map_err(|e| anyhow!("--run: {e}"))?;
+        let msg = runner.lock().unwrap().run_named(&name, &Value::Object(run_opts), run_at.as_deref());
+        println!("--run {name}: {}", msg.map_err(|e| anyhow!("--run: {e}"))?);
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("PS5").with_inner_size([1280.0, 760.0]),
@@ -139,6 +188,7 @@ fn main() -> Result<()> {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
+            let _ = app_shared.ctx.set(cc.egui_ctx.clone());
             Ok(Box::new(Viewer { shared: app_shared, frames, texture: None, shown: None, runner }))
         }),
     );
@@ -147,6 +197,43 @@ fn main() -> Result<()> {
     rt.block_on(client.close());
     println!("closed");
     result.map_err(|e| anyhow!("window error: {e}"))
+}
+
+/// Runs macros' schedules and time limits, and handles a quit signal, off the window thread:
+/// macOS stops repainting a hidden or minimized window, and these must not wait for it.
+fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
+    std::thread::Builder::new()
+        .name("supervisor".into())
+        .spawn(move || {
+            let mut quit_since: Option<Instant> = None;
+            loop {
+                let ended = sh.runner.lock().unwrap().poll();
+                if let Some(ended) = ended {
+                    // however the macro ended, release any input left pressed
+                    sh.release_all();
+                    sh.stop_play.store(true, Ordering::SeqCst);
+                    if ended.standby {
+                        sh.client.standby();
+                    }
+                }
+                if sh.quit.load(Ordering::SeqCst)
+                    && let Some(ctx) = sh.ctx.get()
+                {
+                    // the window closes on its next frame; make sure there is one
+                    ctx.request_repaint();
+                    // a window macOS keeps asleep may never draw it: close the session here instead
+                    if quit_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
+                        sh.runner.lock().unwrap().shutdown();
+                        sh.release_all();
+                        rt.block_on(sh.client.close());
+                        println!("closed");
+                        std::process::exit(0);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .expect("supervisor thread");
 }
 
 /// Waits for Ctrl+C (and SIGTERM on Unix).
@@ -165,10 +252,10 @@ async fn wait_for_quit_signal() {
 
 /// The console reports "another session connected" for a few seconds while it cleans up the previous
 /// session, so retry a few times.
-async fn connect(host: &str) -> Result<Client> {
+async fn connect(host: &str, opts: Options) -> Result<Client> {
     let mut k = 0;
     loop {
-        match Client::connect(host, Options::default()).await {
+        match Client::connect(host, opts.clone()).await {
             Err(psconnector::Error::Busy) if k < 7 => {
                 k += 1;
                 println!("previous session still active, retrying in 5 s");
@@ -191,25 +278,86 @@ fn setup_fonts(ctx: &egui::Context) {
 
 // ------------------------------------------------------------ macro runner
 
+/// After a time limit is reached, how long a macro that polls `should_stop` gets to finish on its own
+/// before it is interrupted.
+const GRACE: Duration = Duration::from_secs(120);
+
+/// What to do when a macro ends by itself or by its time limit (not on a manual ■ Stop).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum After {
+    #[default]
+    Nothing,
+    Standby,
+}
+
+impl After {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" | "nothing" | "stop" => Some(Self::Nothing),
+            "standby" | "rest" => Some(Self::Standby),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nothing => "none",
+            Self::Standby => "standby",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nothing => "then nothing",
+            Self::Standby => "then rest mode",
+        }
+    }
+}
+
+/// How long to run and what to do afterwards.
+#[derive(Clone, Copy, Default, Debug)]
+struct Plan {
+    /// 0 = no limit
+    limit_min: u32,
+    after: After,
+}
+
+impl Plan {
+    /// Reads `limit_min` and `after` from a JSON object, keeping `self` for missing fields.
+    fn merged(self, v: &Value) -> Result<Self, String> {
+        let limit_min = match &v["limit_min"] {
+            Value::Null => self.limit_min,
+            n => n.as_f64().filter(|n| *n >= 0.0).ok_or("limit_min must be a number of minutes")?.round() as u32,
+        };
+        let after = match v["after"].as_str() {
+            None => self.after,
+            Some(s) => After::parse(s).ok_or_else(|| format!("after must be none or standby, not '{s}'"))?,
+        };
+        Ok(Self { limit_min, after })
+    }
+}
+
 #[derive(Clone)]
 struct MacroDef {
     name: String,
     cmd: String,
     cwd: Option<PathBuf>,
     env: Vec<(String, String)>,
+    /// Default limit and after-action from the list
+    plan: Plan,
 }
 
-/// `[{"name": "...", "cmd": "python3 -u farm.py 0", "cwd": "~/...", "env": {"K": "V"}}]`
+/// `[{"name": "...", "cmd": "python3 -u farm.py 0", "cwd": "~/...", "env": {"K": "V"}, "limit_min": 60, "after": "standby"}]`
 fn load_macros(path: &PathBuf) -> Result<Vec<MacroDef>, String> {
     let text = std::fs::read_to_string(path).map_err(|_| format!("no macro list: {}", path.display()))?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("macro list JSON error: {e}"))?;
     let list = v.as_array().ok_or("the macro list must be a JSON array")?;
-    Ok(list
-        .iter()
-        .filter_map(|m| {
-            Some(MacroDef {
-                name: m["name"].as_str()?.to_string(),
-                cmd: m["cmd"].as_str()?.to_string(),
+    list.iter()
+        .filter(|m| m["name"].is_string() && m["cmd"].is_string())
+        .map(|m| {
+            let name = m["name"].as_str().unwrap_or_default().to_string();
+            Ok(MacroDef {
+                cmd: m["cmd"].as_str().unwrap_or_default().to_string(),
                 cwd: m["cwd"].as_str().map(expand),
                 env: m["env"]
                     .as_object()
@@ -219,16 +367,62 @@ fn load_macros(path: &PathBuf) -> Result<Vec<MacroDef>, String> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                plan: Plan::default().merged(m).map_err(|e| format!("macro '{name}': {e}"))?,
+                name,
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Next local time matching `HH:MM` (today or tomorrow), or `+MIN` minutes from now.
+fn parse_start_time(text: &str) -> Result<(SystemTime, String), String> {
+    let text = text.trim();
+    let wait = if let Some(min) = text.strip_prefix('+') {
+        let min: u64 = min.trim().parse().map_err(|_| "use HH:MM or +MINUTES")?;
+        Duration::from_secs(min * 60)
+    } else {
+        let t = chrono::NaiveTime::parse_from_str(text, "%H:%M").map_err(|_| "use HH:MM or +MINUTES")?;
+        let now = chrono::Local::now().naive_local();
+        let mut at = now.date().and_time(t);
+        if at <= now {
+            at += chrono::TimeDelta::days(1);
+        }
+        (at - now).to_std().unwrap_or_default()
+    };
+    let at = SystemTime::now() + wait;
+    let label = chrono::DateTime::<chrono::Local>::from(at).format("%m-%d %H:%M").to_string();
+    Ok((at, label))
+}
+
+fn hms(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
+struct Scheduled {
+    index: usize,
+    plan: Plan,
+    at: SystemTime,
+    label: String,
 }
 
 struct Running {
     name: String,
     child: Child,
     started: Instant,
+    plan: Plan,
+    deadline: Option<Instant>,
+    /// When the time limit was reached (`should_stop` answers yes from then on)
+    wind_down: Option<Instant>,
+    /// The macro has asked `should_stop` at least once, so it gets the grace period
+    cooperative: bool,
+    manual_stop: bool,
     stop_sent: Option<Instant>,
+}
+
+/// How a macro run ended, for the caller to act on.
+struct Ended {
+    standby: bool,
 }
 
 struct Runner {
@@ -236,6 +430,11 @@ struct Runner {
     path: PathBuf,
     port: u16,
     selected: usize,
+    /// Limit and after-action set in the bar for the next run
+    plan: Plan,
+    /// Start-time text field in the bar
+    at_text: String,
+    scheduled: Option<Scheduled>,
     running: Option<Running>,
     log: Arc<Mutex<VecDeque<String>>>,
     last_exit: Option<String>,
@@ -243,21 +442,36 @@ struct Runner {
 
 impl Runner {
     fn new(macros: Result<Vec<MacroDef>, String>, path: PathBuf, port: u16) -> Self {
-        Self {
+        let mut r = Self {
             macros,
             path,
             port,
             selected: 0,
+            plan: Plan::default(),
+            at_text: String::new(),
+            scheduled: None,
             running: None,
             log: Arc::new(Mutex::new(VecDeque::new())),
             last_exit: None,
+        };
+        r.select(0);
+        r
+    }
+
+    /// Selects a macro and loads its default limit and after-action into the bar.
+    fn select(&mut self, i: usize) {
+        self.selected = i;
+        if let Ok(list) = &self.macros
+            && let Some(m) = list.get(i)
+        {
+            self.plan = m.plan;
         }
     }
 
     fn reload(&mut self) {
-        if self.running.is_none() {
+        if self.running.is_none() && self.scheduled.is_none() {
             self.macros = load_macros(&self.path);
-            self.selected = 0;
+            self.select(0);
         }
     }
 
@@ -270,8 +484,13 @@ impl Runner {
     }
 
     fn start(&mut self) {
+        let (i, plan) = (self.selected, self.plan);
+        self.start_with(i, plan);
+    }
+
+    fn start_with(&mut self, index: usize, plan: Plan) {
         let Ok(list) = &self.macros else { return };
-        let Some(m) = list.get(self.selected).cloned() else { return };
+        let Some(m) = list.get(index).cloned() else { return };
         let mut cmd = shell_command(&m.cmd);
         cmd.env("PSCONNECTOR_PORT", self.port.to_string())
             .env("PYTHONUNBUFFERED", "1")
@@ -301,31 +520,92 @@ impl Runner {
                         }
                     });
                 }
-                Self::push_log(&self.log, format!("▶ {} started", m.name));
+                let limit = (plan.limit_min > 0).then(|| Duration::from_secs(u64::from(plan.limit_min) * 60));
+                let note = match limit {
+                    Some(_) => format!(" for {} min, {}", plan.limit_min, plan.after.label()),
+                    None if plan.after == After::Standby => format!(", {}", plan.after.label()),
+                    None => String::new(),
+                };
+                Self::push_log(&self.log, format!("▶ {} started{note}", m.name));
                 self.last_exit = None;
-                self.running = Some(Running { name: m.name, child, started: Instant::now(), stop_sent: None });
+                let started = Instant::now();
+                self.running = Some(Running {
+                    name: m.name,
+                    child,
+                    started,
+                    plan,
+                    deadline: limit.map(|d| started + d),
+                    wind_down: None,
+                    cooperative: false,
+                    manual_stop: false,
+                    stop_sent: None,
+                });
             }
             Err(e) => Self::push_log(&self.log, format!("failed to start: {e}")),
         }
     }
 
-    /// Runs the first macro whose name equals or contains `name`
-    fn start_named(&mut self, name: &str) -> Result<(), String> {
+    /// Index of the first macro whose name equals or contains `name`
+    fn find(&self, name: &str) -> Result<usize, String> {
+        let list = self.macros.as_ref().map_err(|e| e.clone())?;
+        list.iter()
+            .position(|m| m.name == name)
+            .or_else(|| list.iter().position(|m| m.name.contains(name)))
+            .ok_or_else(|| format!("no macro named '{name}'"))
+    }
+
+    /// Runs a macro by name now, or schedules it when `at` is given. `opts` may override
+    /// `limit_min` and `after` from the list.
+    fn run_named(&mut self, name: &str, opts: &Value, at: Option<&str>) -> Result<String, String> {
         if self.running.is_some() {
             return Err("another macro is already running".into());
         }
-        let list = self.macros.as_ref().map_err(|e| e.clone())?;
-        let i = list
-            .iter()
-            .position(|m| m.name == name)
-            .or_else(|| list.iter().position(|m| m.name.contains(name)))
-            .ok_or_else(|| format!("no macro named '{name}'"))?;
-        self.selected = i;
-        self.start();
+        let i = self.find(name)?;
+        self.select(i);
+        let plan = self.plan.merged(opts)?;
+        self.plan = plan;
+        if let Some(at) = at {
+            return self.schedule(i, plan, at);
+        }
+        self.scheduled = None;
+        self.start_with(i, plan);
         if self.running.is_none() {
             return Err(self.log.lock().unwrap().back().cloned().unwrap_or_else(|| "failed to start".into()));
         }
-        Ok(())
+        Ok("started".into())
+    }
+
+    fn schedule(&mut self, index: usize, plan: Plan, at: &str) -> Result<String, String> {
+        let (when, label) = parse_start_time(at)?;
+        let name = self.macros.as_ref().ok().and_then(|l| l.get(index)).map(|m| m.name.clone()).unwrap_or_default();
+        Self::push_log(&self.log, format!("⏰ {name} scheduled for {label}"));
+        self.scheduled = Some(Scheduled { index, plan, at: when, label: label.clone() });
+        Ok(format!("scheduled for {label}"))
+    }
+
+    /// Schedules the macro selected in the bar at the time typed in the bar.
+    fn schedule_selected(&mut self) {
+        let (i, plan, at) = (self.selected, self.plan, self.at_text.clone());
+        if let Err(e) = self.schedule(i, plan, &at) {
+            Self::push_log(&self.log, format!("schedule: {e}"));
+        }
+    }
+
+    fn cancel_schedule(&mut self) {
+        if self.scheduled.take().is_some() {
+            Self::push_log(&self.log, "⏰ schedule cancelled".into());
+        }
+    }
+
+    /// Asked by the macro through the command port: true once its time limit is up.
+    fn should_stop(&mut self) -> bool {
+        match self.running.as_mut() {
+            Some(r) => {
+                r.cooperative = true;
+                r.wind_down.is_some() || r.stop_sent.is_some()
+            }
+            None => false,
+        }
     }
 
     /// Status as JSON (for the command port and MCP)
@@ -334,10 +614,22 @@ impl Runner {
             let l = self.log.lock().unwrap();
             l.iter().skip(l.len().saturating_sub(lines)).cloned().collect()
         };
+        let r = self.running.as_ref();
         serde_json::json!({
-            "running": self.running.as_ref().map(|r| r.name.clone()),
-            "elapsed_sec": self.running.as_ref().map(|r| r.started.elapsed().as_secs()),
-            "stopping": self.running.as_ref().is_some_and(|r| r.stop_sent.is_some()),
+            "running": r.map(|r| r.name.clone()),
+            "elapsed_sec": r.map(|r| r.started.elapsed().as_secs()),
+            "limit_min": r.map(|r| r.plan.limit_min).filter(|m| *m > 0),
+            "left_sec": r.and_then(|r| r.deadline).map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
+            "after": r.map(|r| r.plan.after.as_str()),
+            "winding_down": r.is_some_and(|r| r.wind_down.is_some()),
+            "stopping": r.is_some_and(|r| r.stop_sent.is_some()),
+            "scheduled": self.scheduled.as_ref().map(|s| serde_json::json!({
+                "name": self.macros.as_ref().ok().and_then(|l| l.get(s.index)).map(|m| m.name.clone()),
+                "at": s.label,
+                "in_sec": s.at.duration_since(SystemTime::now()).unwrap_or_default().as_secs(),
+                "limit_min": s.plan.limit_min,
+                "after": s.plan.after.as_str(),
+            })),
             "last_exit": self.last_exit,
             "log": log,
         })
@@ -346,13 +638,26 @@ impl Runner {
     fn list_json(&self) -> Value {
         match &self.macros {
             Ok(list) => serde_json::json!(
-                list.iter().map(|m| serde_json::json!({"name": m.name, "cmd": m.cmd})).collect::<Vec<_>>()
+                list.iter()
+                    .map(|m| serde_json::json!({
+                        "name": m.name, "cmd": m.cmd, "limit_min": m.plan.limit_min, "after": m.plan.after.as_str()
+                    }))
+                    .collect::<Vec<_>>()
             ),
             Err(e) => serde_json::json!({"error": e}),
         }
     }
 
+    /// Manual stop (■ Stop, macro_stop): also cancels a pending schedule. The after-action is skipped.
     fn stop(&mut self) {
+        self.cancel_schedule();
+        if let Some(r) = self.running.as_mut() {
+            r.manual_stop = true;
+        }
+        self.interrupt_running();
+    }
+
+    fn interrupt_running(&mut self) {
         if let Some(r) = self.running.as_mut().filter(|r| r.stop_sent.is_none()) {
             interrupt(&mut r.child);
             r.stop_sent = Some(Instant::now());
@@ -360,9 +665,27 @@ impl Runner {
         }
     }
 
-    /// Called every frame: checks for exit and kills the process 3 s after a stop signal. True when it ended.
-    fn poll(&mut self) -> bool {
-        let Some(r) = self.running.as_mut() else { return false };
+    /// Called every frame: starts a scheduled macro when its time comes, enforces the time limit,
+    /// kills the process 3 s after a stop signal and reports when it ended.
+    fn poll(&mut self) -> Option<Ended> {
+        if self.running.is_none() {
+            if self.scheduled.as_ref().is_some_and(|s| SystemTime::now() >= s.at) {
+                let s = self.scheduled.take()?;
+                self.start_with(s.index, s.plan);
+            }
+            return None;
+        }
+        let r = self.running.as_mut()?;
+        if r.wind_down.is_none() && r.deadline.is_some_and(|d| Instant::now() >= d) {
+            r.wind_down = Some(Instant::now());
+            let how = if r.cooperative { "asking the macro to finish" } else { "stopping" };
+            Self::push_log(&self.log, format!("⏱ time limit reached, {how}"));
+        }
+        // a macro that polls should_stop gets GRACE to wrap up; others are interrupted right away
+        if r.stop_sent.is_none() && r.wind_down.is_some_and(|w| !r.cooperative || w.elapsed() > GRACE) {
+            self.interrupt_running();
+        }
+        let r = self.running.as_mut()?;
         if let Some(t) = r.stop_sent
             && t.elapsed() > Duration::from_secs(3)
         {
@@ -375,12 +698,14 @@ impl Runner {
                     Some(c) => format!("exit code {c}"),
                     None => "killed by signal".to_string(),
                 };
-                Self::push_log(&self.log, format!("{} {how}", r.name));
+                let how = if r.wind_down.is_some() { format!("{how} (time limit)") } else { how };
+                let standby = r.plan.after == After::Standby && !r.manual_stop;
+                Self::push_log(&self.log, format!("{} {how}{}", r.name, if standby { ", → rest mode" } else { "" }));
                 self.last_exit = Some(how);
                 self.running = None;
-                true
+                Some(Ended { standby })
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -445,34 +770,89 @@ impl Viewer {
                 Err(_) => Vec::new(),
             };
             let idle = r.running.is_none();
-            ui.add_enabled_ui(idle && !names.is_empty(), |ui| {
+            let waiting = r.scheduled.is_some();
+            ui.add_enabled_ui(idle && !waiting && !names.is_empty(), |ui| {
+                let mut selected = r.selected;
                 egui::ComboBox::from_id_salt("macro")
-                    .selected_text(names.get(r.selected).cloned().unwrap_or_else(|| "no macros".into()))
-                    .width(200.0)
+                    .selected_text(names.get(selected).cloned().unwrap_or_else(|| "no macros".into()))
+                    .width(180.0)
                     .show_ui(ui, |ui| {
                         for (i, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut r.selected, i, n);
+                            ui.selectable_value(&mut selected, i, n);
                         }
                     });
+                if selected != r.selected {
+                    r.select(selected);
+                }
+                ui.add(
+                    egui::DragValue::new(&mut r.plan.limit_min)
+                        .range(0..=24 * 60)
+                        .custom_formatter(|v, _| if v < 1.0 { "no limit".into() } else { format!("{v:.0} min") }),
+                )
+                .on_hover_text(
+                    "Run time limit (drag or type, 0 = no limit). When it is reached, a macro that checks \
+                     ps.should_stop() gets 2 minutes to finish; others are stopped right away.",
+                );
+                egui::ComboBox::from_id_salt("after")
+                    .selected_text(r.plan.after.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for a in [After::Nothing, After::Standby] {
+                            ui.selectable_value(&mut r.plan.after, a, a.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("What to do when the macro ends by itself or at its time limit (not on ■ Stop)");
             });
-            if idle {
+            if !idle {
+                if ui.button("■ Stop").clicked() {
+                    r.stop();
+                }
+            } else if waiting {
+                if ui.button("Cancel schedule").clicked() {
+                    r.cancel_schedule();
+                }
+            } else {
                 if ui.add_enabled(!names.is_empty(), egui::Button::new("▶ Run")).clicked() {
                     r.start();
+                }
+                ui.add(egui::TextEdit::singleline(&mut r.at_text).hint_text("HH:MM").desired_width(48.0))
+                    .on_hover_text("Start time: HH:MM (today, or tomorrow if already past) or +MINUTES");
+                if ui
+                    .add_enabled(!names.is_empty() && !r.at_text.trim().is_empty(), egui::Button::new("⏰ Schedule"))
+                    .clicked()
+                {
+                    r.schedule_selected();
                 }
                 if ui.button("Reload list").clicked() {
                     r.reload();
                 }
-            } else if ui.button("■ Stop").clicked() {
-                r.stop();
             }
-            let status = match (&r.running, &r.macros) {
-                (Some(run), _) => {
-                    let s = run.started.elapsed().as_secs();
-                    let stopping = if run.stop_sent.is_some() { " (stopping)" } else { "" };
-                    format!("{} running {:02}:{:02}:{:02}{stopping}", run.name, s / 3600, s / 60 % 60, s % 60)
+            let status = match (&r.running, &r.scheduled, &r.macros) {
+                (Some(run), _, _) => {
+                    let mut s = format!("{} running {}", run.name, hms(run.started.elapsed()));
+                    if let Some(d) = run.deadline {
+                        s += &format!(" · {} left", hms(d.saturating_duration_since(Instant::now())));
+                    }
+                    if run.plan.after == After::Standby {
+                        s += " · then rest mode";
+                    }
+                    if run.stop_sent.is_some() {
+                        s += " (stopping)";
+                    } else if run.wind_down.is_some() {
+                        s += " (finishing)";
+                    }
+                    s
                 }
-                (None, Err(e)) => e.clone(),
-                (None, Ok(_)) => r.last_exit.clone().map(|e| format!("stopped ({e})")).unwrap_or_else(|| "idle".into()),
+                (None, Some(sc), _) => {
+                    let name = names.get(sc.index).cloned().unwrap_or_default();
+                    let wait = sc.at.duration_since(SystemTime::now()).unwrap_or_default();
+                    format!("{name} starts at {} (in {})", sc.label, hms(wait))
+                }
+                (None, None, Err(e)) => e.clone(),
+                (None, None, Ok(_)) => {
+                    r.last_exit.clone().map(|e| format!("stopped ({e})")).unwrap_or_else(|| "idle".into())
+                }
             };
             ui.label(status);
             let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
@@ -483,6 +863,18 @@ impl Viewer {
                     r.stop();
                     self.shared.client.standby();
                 }
+                if self.shared.sound {
+                    let muted = self.shared.muted.load(Ordering::Relaxed);
+                    if ui.button(if muted { "🔇" } else { "🔊" }).on_hover_text("Mute / unmute the PS5 sound").clicked()
+                    {
+                        self.shared.muted.store(!muted, Ordering::Relaxed);
+                    }
+                }
+                let pad = self.shared.pad.lock().unwrap().clone();
+                match pad {
+                    Some(name) => ui.label(format!("🎮 {name}")),
+                    None => ui.label(egui::RichText::new("🎮 no controller").weak()),
+                };
             });
         });
     }
@@ -495,12 +887,6 @@ impl eframe::App for Viewer {
         if quit || ctx.input(|i| i.key_pressed(egui::Key::Q) && !i.modifiers.any()) {
             self.runner.lock().unwrap().shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        let ended = self.runner.lock().unwrap().poll();
-        if ended {
-            // however the macro ended, release any input left pressed
-            self.shared.release_all();
-            self.shared.stop_play.store(true, Ordering::SeqCst);
         }
 
         egui::Panel::top("bar").show(ui, |ui| self.bar(ui));
@@ -664,7 +1050,12 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         }
         return Ok(Reply::Text(format!("ok {}", r.list_json())));
     } else if let Some(name) = m["macro_run"].as_str() {
-        sh.runner.lock().unwrap().start_named(name).map_err(|e| anyhow!(e))?;
+        // optional "limit_min", "after": "none|standby", "at": "HH:MM|+MIN"
+        let msg = sh.runner.lock().unwrap().run_named(name, &m, m["at"].as_str()).map_err(|e| anyhow!(e))?;
+        return Ok(Reply::Text(format!("ok {msg}")));
+    } else if m.get("should_stop").is_some() {
+        let yes = sh.runner.lock().unwrap().should_stop();
+        return Ok(Reply::Text(if yes { "ok yes" } else { "ok no" }.into()));
     } else if m.get("macro_stop").is_some() {
         sh.runner.lock().unwrap().stop();
     } else if m.get("macro_status").is_some() {
@@ -726,4 +1117,102 @@ fn save_png(path: &str, f: &Frame) -> Result<()> {
     enc.set_compression(png::Compression::Fast);
     enc.write_header()?.write_image_data(&f.rgb)?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn runner_with(cmd: &str, after: &str) -> Runner {
+        let list = vec![MacroDef {
+            name: "test macro".into(),
+            cmd: cmd.into(),
+            cwd: None,
+            env: Vec::new(),
+            plan: Plan::default().merged(&serde_json::json!({"limit_min": 5, "after": after})).unwrap(),
+        }];
+        Runner::new(Ok(list), PathBuf::new(), 0)
+    }
+
+    fn wait_end(r: &mut Runner) -> Ended {
+        let t0 = Instant::now();
+        loop {
+            if let Some(e) = r.poll() {
+                return e;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "macro did not end");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn plan_from_json() {
+        let p = Plan::default().merged(&serde_json::json!({"limit_min": 90, "after": "standby"})).unwrap();
+        assert_eq!((p.limit_min, p.after), (90, After::Standby));
+        let kept = p.merged(&serde_json::json!({})).unwrap();
+        assert_eq!((kept.limit_min, kept.after), (90, After::Standby));
+        assert!(p.merged(&serde_json::json!({"after": "later"})).is_err());
+        assert!(p.merged(&serde_json::json!({"limit_min": -1})).is_err());
+    }
+
+    #[test]
+    fn start_time_parsing() {
+        let (at, _) = parse_start_time("+30").unwrap();
+        let wait = at.duration_since(SystemTime::now()).unwrap().as_secs();
+        assert!((1795..=1800).contains(&wait));
+        let (at, _) = parse_start_time("03:15").unwrap();
+        assert!(at.duration_since(SystemTime::now()).unwrap() <= Duration::from_secs(24 * 3600));
+        assert!(parse_start_time("3pm").is_err());
+    }
+
+    #[test]
+    fn limit_stops_a_macro_that_never_asks_and_then_rests() {
+        let mut r = runner_with("sleep 30", "standby");
+        r.start();
+        assert_eq!(r.plan.limit_min, 5);
+        r.running.as_mut().unwrap().deadline = Some(Instant::now());
+        let end = wait_end(&mut r);
+        assert!(end.standby);
+        assert!(r.last_exit.as_deref().unwrap().contains("time limit"));
+    }
+
+    #[test]
+    fn cooperative_macro_gets_grace_and_is_told_to_stop() {
+        let mut r = runner_with("sleep 30", "none");
+        r.start();
+        assert!(!r.should_stop());
+        r.running.as_mut().unwrap().deadline = Some(Instant::now());
+        assert!(r.poll().is_none());
+        let run = r.running.as_ref().unwrap();
+        assert!(run.wind_down.is_some() && run.stop_sent.is_none(), "should wait for the macro, not interrupt");
+        assert!(r.should_stop());
+        // grace over → interrupted
+        r.running.as_mut().unwrap().wind_down = Some(Instant::now() - GRACE - Duration::from_secs(1));
+        assert!(!wait_end(&mut r).standby);
+    }
+
+    #[test]
+    fn manual_stop_skips_rest_mode_and_cancels_schedule() {
+        let mut r = runner_with("sleep 30", "standby");
+        r.start();
+        r.stop();
+        assert!(!wait_end(&mut r).standby);
+        r.at_text = "+10".into();
+        r.schedule_selected();
+        assert!(r.scheduled.is_some());
+        r.stop();
+        assert!(r.scheduled.is_none());
+    }
+
+    #[test]
+    fn scheduled_macro_starts_when_due() {
+        let mut r = runner_with("true", "none");
+        r.at_text = "+10".into();
+        r.schedule_selected();
+        assert!(r.poll().is_none() && r.running.is_none());
+        r.scheduled.as_mut().unwrap().at = SystemTime::now();
+        assert!(r.poll().is_none());
+        assert!(r.running.is_some(), "should have started");
+        assert!(!wait_end(&mut r).standby);
+    }
 }

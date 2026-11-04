@@ -1,6 +1,6 @@
 [package]
 name = "psconnector"
-description = "PS5 Remote Play client library: session, Takion, controller input, H.264 video"
+description = "PS5 Remote Play client library: session, Takion, controller input, H.264 video, Opus audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ hmac = "0.12"
 k256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "getrandom", "std"] }
 log.workspace = true
 openh264 = "0.9.9"
+opus-decoder = "0.1.1"
 prost = "0.13"
 rand = "0.8"
 serde_json.workspace = true
