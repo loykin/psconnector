@@ -1,13 +1,13 @@
 # PsConnector
 
-A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS or Windows, receives the screen, and sends button and stick input.
+A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS or Windows, receives the screen and sound, and sends button and stick input.
 It is a connection layer that lets game macros and AI assistants operate a PS5.
 
 > Unofficial tool, not affiliated with Sony Interactive Entertainment. PlayStation, PS5 and PS Remote Play are trademarks of Sony.
 
 | Crate | Kind | Purpose |
 |---|---|---|
-| `psconnector` | library | Session, Takion, controller input, video decoding |
+| `psconnector` | library | Session, Takion, controller input, video and audio decoding |
 | `psconnector-view` | binary | Screen window, macro command port (8650), macro bar |
 | `psconnector-mcp` | binary | MCP server for AI assistants (Claude Code, Codex, ...) |
 | `python/psconnector.py` | Python module | Simple interface for writing macros (standard library only) |
@@ -23,15 +23,16 @@ It is a connection layer that lets game macros and AI assistants operate a PS5.
 | Button input (last 5 events sent together, plus one re-send of the same packet) | done |
 | Stick input (state re-sent every 200 ms) | done (verified with analog recording playback in Code Vein) |
 | Rest mode | done |
+| Local game controller (DualSense, ...) in psconnector-view | done (gilrs) |
 | Video (H.264 → RGB, 720p) | done (openh264, about 40 fps for the first 30 frames). Frames with missing units are dropped and a key frame is requested. No FEC recovery yet |
-| Audio | not yet (received and discarded) |
+| Audio (Opus → PCM) | done (pure-Rust Opus decoder; lost packets are filled from the copies in the next ones, then by concealment) |
 | PSN login, PIN registration | not yet (reads the registration saved by pyremoteplay) |
 
 ## Design
 
 **Only the stream task writes to the socket.** Button and stick commands are passed to it over a channel, and it encrypts and sends them in order. Input from many places at once never shares an encryption position (key_pos).
 
-The `psconnector` library only exposes `Client`, `Button`, `Frame`, `Options`, `StreamConfig`, `Phase` and `Error`, plus the `ddp` (status and wake-up) and `profile` (registration) modules. Errors are a `psconnector::Error` enum, so you can handle cases such as `Error::Busy` (another session connected) or `Error::NotOn` (rest mode) separately.
+The `psconnector` library only exposes `Client`, `Button`, `Frame`, `Audio`, `Options`, `StreamConfig`, `Phase` and `Error`, plus the `ddp` (status and wake-up) and `profile` (registration) modules. Errors are a `psconnector::Error` enum, so you can handle cases such as `Error::Busy` (another session connected) or `Error::NotOn` (rest mode) separately.
 
 Internal modules:
 
@@ -45,6 +46,7 @@ Internal modules:
 | `gkcrypt` | Stream-stage encryption (ECDH, key stream, GMAC) |
 | `controller` | Button events and stick state data |
 | `video` | Video unit assembly, decoder thread (openh264) |
+| `audio` | Audio packets, frame order and loss recovery, Opus decoder thread |
 | `proto` | Takion protobuf messages |
 | `profile` | Reading registration data (`~/.pyremoteplay/.profile.json`) |
 
@@ -55,6 +57,7 @@ use psconnector::{Button, Client};
 
 let client = Client::connect("192.168.1.20", Default::default()).await?;
 client.tap(Button::Cross, std::time::Duration::from_millis(80)).await;
+// with Options { audio: true, .. }: client.take_audio() gives 10 ms chunks of 16-bit PCM
 if let Some(frame) = client.frame() {
     println!("{}x{}", frame.width, frame.height); // frame.rgb: 8-bit RGB
 }
@@ -93,7 +96,13 @@ cargo run --release -p psconnector-view -- 192.168.1.20
 | `{"osd":"text"}` show text in the top-left of the window | `ok` |
 | `{"ocr":[x,y,w,h],"scale":2}` read text in a region (macOS Vision) | `ok ["line", ...]` |
 | `{"standby":true}` rest mode | `ok` |
-| `{"macros":true}` / `{"macro_run":"name"}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
+| `{"macros":true}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
+| `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name optional) | `ok started` / `ok scheduled for …` |
+| `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
+
+A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.
+
+The PS5's sound plays on the computer's default output device, kept within about 0.1 s of the picture. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
 
 Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed cleanly.
 
@@ -102,7 +111,8 @@ Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed
 Pick a macro in the bar at the top of the window and press **▶ Run / ■ Stop**. The list lives in `~/.psconnector/macros.json` (see `macros.example.json`).
 
 ```json
-[{"name": "Code Vein farm", "cmd": "python3 -u farm.py 0", "cwd": "~/Project/qewsim/macro", "env": {"FARM_GOAL": "100000"}}]
+[{"name": "Code Vein farm", "cmd": "uv run python -u farm.py", "cwd": "~/Project/codevein-macro",
+  "env": {"FARM_GOAL": "400"}, "limit_min": 0, "after": "standby"}]
 ```
 
 - Macros run as child processes. The port is passed in the `PSCONNECTOR_PORT` environment variable.
@@ -110,6 +120,20 @@ Pick a macro in the bar at the top of the window and press **▶ Run / ■ Stop*
 - However a macro ends, psconnector-view releases every button and centers both sticks, so nothing stays pressed.
 - The bar shows the run time and the last line of the macro's output, with a rest-mode button on the right.
 - `--run NAME` starts a macro right away.
+
+#### Time limit, rest mode afterwards, start time
+
+Next to the macro picker:
+
+- **Limit** (`no limit` / `N min`, drag or type): how long to run. Defaults to `limit_min` from the list.
+- **then nothing / then rest mode**: what to do when the macro ends by itself or at its limit. Defaults to `after`. Pressing ■ Stop yourself never triggers it.
+- **HH:MM + ⏰ Schedule**: start later. `23:30` is today (or tomorrow if already past), `+90` is in 90 minutes. **Cancel schedule** or ■ Stop cancels it.
+
+When the limit is reached, a macro that checks `ps.should_stop()` gets 2 minutes to finish (for example the current lap) and exit; a macro that never checks it is stopped right away. The same options work from the command line and the command port:
+
+```bash
+psconnector-view 192.168.1.20 --run "Code Vein" --for 180 --after standby --at 01:00
+```
 
 ## Python macro interface (`python/psconnector.py`)
 
@@ -125,6 +149,7 @@ ps.stick('left', 0, -1); ps.sleep(0.5); ps.stick('left', 0, 0)
 w, h, rgb = ps.frame()         # ps.frame_array(bgr=True) if numpy is installed
 ps.wait(lambda: ps.pixel(640, 360)[0] > 200, timeout=5)
 lines = ps.ocr(rel=(0.38, 0.63, 0.62, 0.75), scale=2)   # text in a region, as a list of lines
+if ps.should_stop(): ...       # time limit from the bar reached: finish up and exit
 ```
 
 See `python/example_menu_walk.py` for an example.
@@ -151,7 +176,7 @@ Add `--allow-input` at the end to allow input. By default only viewing the scree
 | `macro_list` / `macro_status` / `macro_stop` | Macro list, status and output, stop | |
 | `release_all` | Release every button | |
 | `tap` / `taps` / `press` / `release` / `stick` | Controller input | ✔ |
-| `macro_run` | Run a macro | ✔ |
+| `macro_run` | Run a macro, optionally with a time limit, rest mode afterwards, or a start time | ✔ |
 | `standby` / `wake` | Rest mode, wake-up | ✔ |
 
 For example: "Look at the screen and tell me how to beat this boss", "Run the Code Vein farm", "Open the equipment menu".

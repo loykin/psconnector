@@ -14,6 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 
+use crate::audio::{self, AudioConfig, AudioMsg, AudioTx, Reorder};
 use crate::controller::{Button, EventHistory, Sticks};
 use crate::gkcrypt::{Ecdh, StreamCipher};
 use crate::proto::{self, PayloadType, TakionMessage};
@@ -55,6 +56,17 @@ impl StreamConfig {
 
 /// Channel for sending complete H.264 frames to the decoder thread.
 pub type VideoTx = std::sync::mpsc::Sender<(u16, Vec<u8>)>;
+
+/// Where decoded-to-be video and audio go (None = not wanted)
+pub(crate) struct Outputs {
+    pub video: Option<VideoTx>,
+    pub audio: Option<AudioTx>,
+}
+
+struct AudioState {
+    tx: AudioTx,
+    reorder: Reorder,
+}
 
 struct VideoState {
     tx: VideoTx,
@@ -107,6 +119,7 @@ struct Stream {
     av_received: u16,
     phase: watch::Sender<Phase>,
     video: Option<VideoState>,
+    audio: Option<AudioState>,
 }
 
 impl Stream {
@@ -175,6 +188,20 @@ impl Stream {
             }
             Ok(PayloadType::StreamInfo) => {
                 debug!("got STREAMINFO → ACK");
+                if let Some(a) = &self.audio {
+                    let cfg = msg
+                        .stream_info_payload
+                        .as_ref()
+                        .and_then(|i| i.audio_header.as_deref())
+                        .and_then(AudioConfig::parse);
+                    match cfg {
+                        Some(cfg) => {
+                            info!("audio: {} Hz, {} channels", cfg.rate, cfg.channels);
+                            let _ = a.tx.send(AudioMsg::Config(cfg));
+                        }
+                        None => warn!("STREAMINFO has no usable audio header"),
+                    }
+                }
                 if let Some(v) = self.video.as_mut().filter(|v| v.assembler.is_none()) {
                     let header = msg
                         .stream_info_payload
@@ -199,6 +226,17 @@ impl Stream {
             Err(_) => debug!("received message type {}", msg.r#type),
         }
         Ok(true)
+    }
+
+    /// Audio packet: decrypt → put frames in order → decoder.
+    fn handle_audio(&mut self, pkt: &[u8]) {
+        let (Some(c), Some(a)) = (self.cipher.as_ref(), self.audio.as_mut()) else { return };
+        let Some(p) = audio::parse(pkt) else { return };
+        let mut data = p.data.to_vec();
+        c.remote.xor(p.key_pos, &mut data);
+        for frame in a.reorder.push(p.frame, p.src, p.fec, p.unit_size, &data) {
+            let _ = a.tx.send(AudioMsg::Frame(frame));
+        }
     }
 
     /// Video packet: decrypt → assemble → decoder. Requests a key frame when frames are lost.
@@ -236,7 +274,7 @@ pub async fn run(
     cfg: StreamConfig,
     mut cmd: mpsc::UnboundedReceiver<Cmd>,
     phase: watch::Sender<Phase>,
-    video_tx: Option<VideoTx>,
+    out: Outputs,
 ) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((host.as_str(), PORT)).await?;
@@ -251,7 +289,8 @@ pub async fn run(
         sticks: Sticks::default(),
         av_received: 0,
         phase,
-        video: video_tx.map(|tx| VideoState { tx, assembler: None, last_corrupt: None }),
+        video: out.video.map(|tx| VideoState { tx, assembler: None, last_corrupt: None }),
+        audio: out.audio.map(|tx| AudioState { tx, reorder: Reorder::default() }),
     };
     s.control(chunk::INIT, &takion::init_payload(TAG_LOCAL, s.tsn), 0).await;
 
@@ -277,8 +316,10 @@ pub async fn run(
                     if t == header::VIDEO {
                         let pkt = pkt.to_vec();
                         s.handle_video(&pkt).await;
+                    } else {
+                        s.handle_audio(pkt);
                     }
-                    continue; // audio is not used yet
+                    continue;
                 }
                 let Some(ctl) = takion::parse_control(pkt) else { continue };
                 match ctl.chunk_type {

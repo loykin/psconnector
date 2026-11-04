@@ -13,6 +13,9 @@ When started from the psconnector-view bar the port comes in via PSCONNECTOR_POR
 
 The ■ Stop button in psconnector-view sends SIGINT, which arrives as KeyboardInterrupt, so wrap cleanup
 in try/finally. However the script ends, psconnector-view releases all buttons.
+
+When the run has a time limit, check ps.should_stop() at a safe point (for example after each lap) and exit
+cleanly. Macros that never check it are interrupted as soon as the limit is reached.
 """
 import json
 import os
@@ -141,6 +144,14 @@ class PS:
     def standby(self):
         """Puts the PS5 into rest mode (this also disconnects)."""
         self.call(standby=True)
+
+    def should_stop(self):
+        """True once the run time limit set in psconnector-view is up. Check it at a safe point (end of a lap)
+        and exit; you then get 2 minutes before being interrupted. False when there is no limit."""
+        try:
+            return self.call(should_stop=True) == 'ok yes'
+        except PSError:            # older psconnector-view without time limits
+            return False
 
     @staticmethod
     def sleep(seconds):

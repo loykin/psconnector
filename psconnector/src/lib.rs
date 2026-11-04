@@ -1,7 +1,7 @@
 //! psconnector: a PS5 Remote Play client library.
 //!
 //! Scope: console status and wake-up, session setup, controller input (buttons and sticks), rest mode,
-//! and video (H.264 → RGB). Audio is received but discarded for now.
+//! video (H.264 → RGB) and audio (Opus → 16-bit PCM, when `Options::audio` is on).
 //!
 //! ```no_run
 //! # async fn demo() -> psconnector::Result<()> {
@@ -17,6 +17,7 @@ pub mod ddp;
 pub mod profile;
 
 // Internals (protocol, crypto, packets). Only the needed types are re-exported below.
+mod audio;
 mod controller;
 mod error;
 mod gkcrypt;
@@ -37,6 +38,7 @@ use std::time::Duration;
 pub use error::{Error, Result};
 use tokio::sync::{mpsc, watch};
 
+pub use audio::Audio;
 pub use controller::Button;
 use std::sync::Arc;
 pub use stream::{Phase, StreamConfig};
@@ -51,11 +53,13 @@ pub struct Options {
     pub stream: StreamConfig,
     /// Whether to receive and decode video (when off, only input is used and the lowest quality is requested)
     pub video: bool,
+    /// Whether to decode audio. Take the decoded chunks with [`Client::take_audio`].
+    pub audio: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { profile: None, user: None, stream: StreamConfig::default(), video: true }
+        Self { profile: None, user: None, stream: StreamConfig::default(), video: true, audio: false }
     }
 }
 
@@ -66,6 +70,7 @@ pub struct Client {
     ctrl: mpsc::UnboundedSender<session::CtrlCmd>,
     phase: watch::Receiver<Phase>,
     frame: watch::Receiver<Option<Arc<Frame>>>,
+    audio: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Audio>>>,
     stream_task: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     ctrl_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -92,6 +97,15 @@ impl Client {
         } else {
             (None, StreamConfig::minimal())
         };
+        // decoded audio waits here for at most ~0.5 s; past that it is dropped rather than piling up
+        let (audio_tx, audio_rx) = if opts.audio {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(50);
+            audio::spawn_decoder(rx, out_tx);
+            (Some(tx), Some(out_rx))
+        } else {
+            (None, None)
+        };
         let stream_task = tokio::spawn(stream::run(
             host.to_string(),
             started.session_id,
@@ -99,7 +113,7 @@ impl Client {
             cfg,
             cmd_rx,
             phase_tx,
-            video_tx,
+            stream::Outputs { video: video_tx, audio: audio_tx },
         ));
         let phase =
             match tokio::time::timeout(Duration::from_secs(15), phase_rx.wait_for(|p| *p != Phase::Connecting)).await {
@@ -117,6 +131,7 @@ impl Client {
             ctrl: started.ctrl,
             phase: phase_rx,
             frame: frame_rx,
+            audio: std::sync::Mutex::new(audio_rx),
             stream_task: std::sync::Mutex::new(Some(stream_task)),
             ctrl_task: std::sync::Mutex::new(Some(started.ctrl_task)),
         })
@@ -144,6 +159,11 @@ impl Client {
     /// Returns another frame receiver (for receiving frames on other threads or tasks).
     pub fn frames(&self) -> watch::Receiver<Option<Arc<Frame>>> {
         self.frame.clone()
+    }
+
+    /// Decoded audio, in 10 ms chunks (only with `Options::audio`). Can be taken once.
+    pub fn take_audio(&self) -> Option<std::sync::mpsc::Receiver<Audio>> {
+        self.audio.lock().unwrap().take()
     }
 
     pub fn press(&self, b: Button) {

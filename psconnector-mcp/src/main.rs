@@ -32,7 +32,7 @@ const INSTRUCTIONS: &str = "Tools to see a PS5 Remote Play screen and control it
 - Button names: up down left right l1 r1 l2 r2 cross circle square triangle options share ps l3 r3 touchpad.
 - Sticks: which=left|right, x and y in -1.0..1.0 (up is negative). With duration, the stick is held that long and then centered.
 - Input is sent in order; psconnector-view encrypts and sends everything from one place. release_all releases everything at once.
-- Macros (the list in the psconnector-view bar) can be handled with macro_list / macro_run / macro_stop / macro_status.
+- Macros (the list in the psconnector-view bar) can be handled with macro_list / macro_run (with optional time limit, rest mode afterwards, start time) / macro_stop / macro_status.
 - psconnector-view must be running (it owns the PS5 connection).";
 
 /// Connection to the psconnector-view command port (connects on first use, reconnects after errors)
@@ -172,9 +172,15 @@ struct TextArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct NameArgs {
+struct RunArgs {
     /// Macro name (equal to, or part of, a name in the list)
     name: String,
+    /// Run time limit in minutes (0 = no limit). Defaults to the macro list setting.
+    limit_min: Option<u32>,
+    /// What to do when it ends by itself or at the limit: "none" or "standby" (PS5 rest mode).
+    after: Option<String>,
+    /// Start later instead of now: local "HH:MM" (today, or tomorrow if past) or "+MINUTES".
+    at: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -316,15 +322,27 @@ impl Psconnector {
         ok_text(s)
     }
 
-    #[tool(description = "Runs a macro (fails if one is already running).")]
-    async fn macro_run(&self, Parameters(a): Parameters<NameArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Runs a macro now, or schedules it with `at` (fails if one is already running). Optional run time limit and after-action (rest mode)."
+    )]
+    async fn macro_run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, McpError> {
         tri!(self.need_input());
-        tri!(self.call(json!({"macro_run": a.name})).await);
-        ok_text(format!("started {}", a.name))
+        let mut msg = json!({"macro_run": a.name});
+        if let Some(m) = a.limit_min {
+            msg["limit_min"] = m.into();
+        }
+        if let Some(after) = a.after {
+            msg["after"] = after.into();
+        }
+        if let Some(at) = a.at {
+            msg["at"] = at.into();
+        }
+        let reply = tri!(self.call(msg).await);
+        ok_text(format!("{}: {reply}", a.name))
     }
 
     #[tool(
-        description = "Stops the running macro (SIGINT, killed after 3 s). psconnector-view then releases all buttons."
+        description = "Stops the running macro (SIGINT, killed after 3 s) and cancels a scheduled one. psconnector-view then releases all buttons. The after-action is skipped."
     )]
     async fn macro_stop(&self) -> Result<CallToolResult, McpError> {
         tri!(self.call(json!({"macro_stop": true})).await);
