@@ -106,7 +106,8 @@ jobs:
           mkdir -p "$BASE/python" artifacts
           cp "target/${{ matrix.target }}/release/psconnector-view${EXT}" "$BASE/"
           cp "target/${{ matrix.target }}/release/psconnector-mcp${EXT}" "$BASE/"
-          cp README.md LICENSE macros.example.json "$BASE/"
+          cp README.md LICENSE "$BASE/"
+          cp -R macros "$BASE/"
           cp python/*.py "$BASE/python/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a -tzip "artifacts/${BASE}.zip" "$BASE"

@@ -77,7 +77,8 @@ impl Sticks {
 }
 
 /// Starts the controller thread. `name` holds the connected pad's name for the window.
-pub fn spawn(client: Arc<Client>, name: Arc<Mutex<Option<String>>>) {
+/// `client` gives the current connection (it changes when the viewer reconnects).
+pub fn spawn(client: impl Fn() -> Arc<Client> + Send + 'static, name: Arc<Mutex<Option<String>>>) {
     std::thread::spawn(move || {
         let mut gilrs = match Gilrs::new() {
             Ok(g) => g,
@@ -88,7 +89,9 @@ pub fn spawn(client: Arc<Client>, name: Arc<Mutex<Option<String>>>) {
         };
         // pads show up a moment after start (as Connected events), not right away
         let update_name = |g: &Gilrs| {
-            let first = g.gamepads().next().map(|(_, p)| p.os_name().to_string());
+            // "DualSense Edge Wireless Controller" → "DualSense Edge", to keep the bar short
+            let first =
+                g.gamepads().next().map(|(_, p)| p.os_name().trim_end_matches(" Wireless Controller").to_string());
             if let Some(n) = &first {
                 log::info!("game controller: {n}");
             }
@@ -103,29 +106,30 @@ pub fn spawn(client: Arc<Client>, name: Arc<Mutex<Option<String>>>) {
             match ev.event {
                 EventType::ButtonPressed(b, _) => {
                     if let Some(b) = map(b) {
-                        client.press(b);
+                        client().press(b);
                     }
                 }
                 EventType::ButtonReleased(b, _) => {
                     if let Some(b) = map(b) {
-                        client.release(b);
+                        client().release(b);
                     }
                 }
                 EventType::AxisChanged(axis, v, _) => {
                     if let Some(right) = sticks.set(axis, v)
                         && let Some((x, y)) = sticks.changed(right)
                     {
-                        client.stick(right, x, y);
+                        client().stick(right, x, y);
                     }
                 }
                 EventType::Connected => update_name(&gilrs),
                 EventType::Disconnected => {
                     // let go of everything the pad might have been holding
+                    let c = client();
                     for b in Button::ALL {
-                        client.release(b);
+                        c.release(b);
                     }
                     for right in [false, true] {
-                        client.stick(right, 0.0, 0.0);
+                        c.stick(right, 0.0, 0.0);
                     }
                     sticks = Sticks::default();
                     update_name(&gilrs);

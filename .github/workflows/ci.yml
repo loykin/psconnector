@@ -52,7 +52,7 @@ jobs:
         run: cargo test --workspace --release --locked
 
       - name: Python module syntax
-        run: python -m py_compile python/psconnector.py python/example_menu_walk.py
+        run: python -m py_compile python/psconnector.py macros/menu-walk/menu_walk.py
 
   audit:
     name: Dependency audit (RustSec)

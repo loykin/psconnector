@@ -2,3 +2,8 @@
 .idea/
 .DS_Store
 __pycache__/
+
+# your own macros live in macros/ too; only the examples are part of the repository
+/macros/*
+!/macros/README.md
+!/macros/menu-walk/
