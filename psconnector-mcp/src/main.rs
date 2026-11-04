@@ -383,8 +383,8 @@ impl ServerHandler for Psconnector {
 }
 
 fn default_host() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let text = std::fs::read_to_string(format!("{home}/.ps5rmtctl/config.json")).ok()?;
+    let home = std::env::home_dir()?;
+    let text = std::fs::read_to_string(home.join(".ps5rmtctl").join("config.json")).ok()?;
     serde_json::from_str::<Value>(&text).ok()?["host"].as_str().map(str::to_string)
 }
 

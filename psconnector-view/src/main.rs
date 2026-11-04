@@ -12,7 +12,7 @@
 //!
 //! Commands: `{"button":"cross","action":"tap|press|release","hold":0.08}` `{"stick":"left","x":0,"y":-1}`
 //! `{"release_all":true}` `{"snap":"path.png"}` `{"frame":true}` `{"play":"recording.json"}` `{"stop":true}`
-//! `{"status":true}` `{"osd":"text"}` `{"standby":true}`
+//! `{"status":true}` `{"osd":"text"}` `{"standby":true}` `{"ocr":[x,y,w,h],"scale":2}` (reply `ok ["line", ...]`)
 //! Macros: `{"macros":true}` `{"macro_run":"name"}` `{"macro_stop":true}` `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
 //! Replies are one line: `ok` / `ok playing` / `ok idle` / `err REASON`.
 //! Only `frame` is followed by raw RGB bytes after its `ok WIDTH HEIGHT BYTES` line. Press Q in the window to quit.
@@ -31,6 +31,8 @@ use psconnector::{Button, Client, Frame, Options};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+mod ocr;
 
 const DEFAULT_PORT: u16 = 8650;
 /// System font with Korean glyphs (falls back to egui's default font if missing)
@@ -62,20 +64,21 @@ impl Shared {
     }
 }
 
-fn home() -> String {
-    std::env::var("HOME").unwrap_or_default()
+/// Home folder (`%USERPROFILE%` on Windows).
+fn home() -> PathBuf {
+    std::env::home_dir().unwrap_or_default()
 }
 
 fn expand(p: &str) -> PathBuf {
-    match p.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(home()).join(rest),
+    match p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        Some(rest) => home().join(rest),
         None => PathBuf::from(p),
     }
 }
 
 fn default_host() -> Option<String> {
     // default console address saved by ps5rmtctl
-    let text = std::fs::read_to_string(format!("{}/.ps5rmtctl/config.json", home())).ok()?;
+    let text = std::fs::read_to_string(home().join(".ps5rmtctl").join("config.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     v["host"].as_str().map(str::to_string)
 }
@@ -269,11 +272,8 @@ impl Runner {
     fn start(&mut self) {
         let Ok(list) = &self.macros else { return };
         let Some(m) = list.get(self.selected).cloned() else { return };
-        // `exec` replaces the shell with the macro so the stop signal reaches the macro, not the shell
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg(format!("exec {}", m.cmd))
-            .env("PSCONNECTOR_PORT", self.port.to_string())
+        let mut cmd = shell_command(&m.cmd);
+        cmd.env("PSCONNECTOR_PORT", self.port.to_string())
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -392,6 +392,23 @@ impl Runner {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Runs the macro command line through the system shell.
+#[cfg(unix)]
+fn shell_command(line: &str) -> Command {
+    // `exec` replaces the shell with the macro so the stop signal reaches the macro, not the shell
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(format!("exec {line}"));
+    cmd
+}
+
+#[cfg(windows)]
+fn shell_command(line: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").raw_arg(line);
+    cmd
 }
 
 /// Asks the macro to clean up and exit: SIGINT on Unix (KeyboardInterrupt in Python),
@@ -590,6 +607,25 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         let mut out = format!("ok {} {} {}\n", f.width, f.height, f.rgb.len()).into_bytes();
         out.extend_from_slice(&f.rgb);
         return Ok(Reply::Bytes(out));
+    } else if let Some(region) = m.get("ocr") {
+        // {"ocr": [x, y, w, h], "scale": 2.0} → ok ["line", ...]
+        let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
+        let r: Vec<u32> = region
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v.max(0.0) as u32).collect())
+            .unwrap_or_default();
+        let region = match r.as_slice() {
+            [x, y, w, h] => [*x, *y, *w, *h],
+            [] => [0, 0, f.width as u32, f.height as u32],
+            _ => bail!("ocr region must be [x, y, w, h]"),
+        };
+        let scale = m["scale"].as_f64().unwrap_or(1.0) as f32;
+        let lines = tokio::task::spawn_blocking(move || {
+            let (w, h, rgb) = ocr::crop_scale(&f, region, scale);
+            ocr::read_text(&png_bytes(w, h, &rgb)?).map_err(|e| anyhow!(e))
+        })
+        .await??;
+        return Ok(Reply::Text(format!("ok {}", serde_json::to_string(&lines)?)));
     } else if let Some(path) = m["snap"].as_str() {
         let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
         let path = path.to_string();
@@ -670,6 +706,17 @@ async fn play(events: Vec<Value>, sh: Arc<Shared>) {
     c.stick(false, 0.0, 0.0);
     c.stick(true, 0.0, 0.0);
     sh.playing.store(false, Ordering::SeqCst);
+}
+
+fn png_bytes(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_compression(png::Compression::Fast);
+        enc.write_header()?.write_image_data(rgb)?;
+    }
+    Ok(buf)
 }
 
 fn save_png(path: &str, f: &Frame) -> Result<()> {

@@ -32,6 +32,7 @@ class PS:
         port = int(port or os.environ.get('PSCONNECTOR_PORT', 8650))
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._r = self._sock.makefile('rb')
+        self._size = None
 
     # ------------------------------------------------------------ low level
     def call(self, **msg):
@@ -52,6 +53,10 @@ class PS:
 
     def release(self, button):
         self.call(button=button, action='release')
+
+    def button(self, name, action='tap', hold=0.08):
+        """Same call as the older ps5view/pscmd client: action is 'tap', 'press' or 'release'."""
+        self.call(button=name, action=action, hold=hold)
 
     def taps(self, *buttons, hold=0.08, gap=0.05):
         """Taps several buttons in order."""
@@ -90,6 +95,26 @@ class PS:
         w, h, data = self.frame()
         i = (y * w + x) * 3
         return data[i], data[i + 1], data[i + 2]
+
+    def ocr(self, region=None, scale=1.0, rel=None):
+        """Reads text in part of the screen (macOS Vision, Korean + English). Returns a list of lines.
+
+        region: [x, y, w, h] in frame pixels, or rel: (x0, y0, x1, y1) as fractions of the screen.
+        scale enlarges the crop before reading; 1.5-3 helps with small text.
+        """
+        if rel is not None:
+            x0, y0, x1, y1 = rel
+            w, h = self.size()
+            region = [int(w * x0), int(h * y0), int(w * (x1 - x0)), int(h * (y1 - y0))]
+        line = self.call(ocr=list(region or []), scale=float(scale))
+        return json.loads(line[2:].strip() or '[]')
+
+    def size(self):
+        """(width, height) of the stream, cached after the first call."""
+        if self._size is None:
+            w, h, _ = self.frame()
+            self._size = (w, h)
+        return self._size
 
     def snap(self, path):
         """Saves the current frame as PNG."""
