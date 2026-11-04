@@ -12,7 +12,7 @@ aes-gcm = "0.10"
 base64.workspace = true
 cfb-mode = "0.8"
 hmac = "0.12"
-k256 = { version = "0.13", features = ["ecdh"] }
+k256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "getrandom", "std"] }
 log.workspace = true
 openh264 = "0.9.9"
 prost = "0.13"
