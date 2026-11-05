@@ -1,10 +1,7 @@
 //! Picture quality presets. The resolution is agreed with the console when connecting, so changing it
-//! reconnects. The last choice is remembered in `~/.psconnector/settings.json`.
-
-use std::path::PathBuf;
+//! reconnects. The last choice is remembered in the settings file.
 
 use psconnector::StreamConfig;
-use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
@@ -55,32 +52,14 @@ impl Quality {
     }
 }
 
-fn settings_path() -> PathBuf {
-    std::env::home_dir().unwrap_or_default().join(".psconnector").join("settings.json")
-}
-
 /// Quality saved from the last run, if any.
 pub fn saved() -> Option<Quality> {
-    let text = std::fs::read_to_string(settings_path()).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    Quality::parse(v["quality"].as_str()?)
+    Quality::parse(crate::settings::get("quality")?.as_str()?)
 }
 
-/// Remembers the quality for the next run (other settings in the file are kept).
+/// Remembers the quality for the next run.
 pub fn save(q: Quality) {
-    let path = settings_path();
-    let mut v: Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["quality"] = q.name().into();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Err(e) = std::fs::write(&path, format!("{v:#}\n")) {
-        log::warn!("cannot save {}: {e}", path.display());
-    }
+    crate::settings::set("quality", q.name().into());
 }
 
 #[cfg(test)]

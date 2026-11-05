@@ -77,8 +77,9 @@ impl Sticks {
 }
 
 /// Starts the controller thread. `name` holds the connected pad's name for the window.
-/// `client` gives the current connection (it changes when the viewer reconnects).
-pub fn spawn(client: impl Fn() -> Arc<Client> + Send + 'static, name: Arc<Mutex<Option<String>>>) {
+/// `client` gives the current connection (it changes when the viewer reconnects; None = not connected,
+/// input is dropped). Runs for the whole program.
+pub fn spawn(client: impl Fn() -> Option<Arc<Client>> + Send + 'static, name: Arc<Mutex<Option<String>>>) {
     std::thread::spawn(move || {
         let mut gilrs = match Gilrs::new() {
             Ok(g) => g,
@@ -105,31 +106,33 @@ pub fn spawn(client: impl Fn() -> Arc<Client> + Send + 'static, name: Arc<Mutex<
             };
             match ev.event {
                 EventType::ButtonPressed(b, _) => {
-                    if let Some(b) = map(b) {
-                        client().press(b);
+                    if let (Some(b), Some(c)) = (map(b), client()) {
+                        c.press(b);
                     }
                 }
                 EventType::ButtonReleased(b, _) => {
-                    if let Some(b) = map(b) {
-                        client().release(b);
+                    if let (Some(b), Some(c)) = (map(b), client()) {
+                        c.release(b);
                     }
                 }
                 EventType::AxisChanged(axis, v, _) => {
                     if let Some(right) = sticks.set(axis, v)
                         && let Some((x, y)) = sticks.changed(right)
+                        && let Some(c) = client()
                     {
-                        client().stick(right, x, y);
+                        c.stick(right, x, y);
                     }
                 }
                 EventType::Connected => update_name(&gilrs),
                 EventType::Disconnected => {
                     // let go of everything the pad might have been holding
-                    let c = client();
-                    for b in Button::ALL {
-                        c.release(b);
-                    }
-                    for right in [false, true] {
-                        c.stick(right, 0.0, 0.0);
+                    if let Some(c) = client() {
+                        for b in Button::ALL {
+                            c.release(b);
+                        }
+                        for right in [false, true] {
+                            c.stick(right, 0.0, 0.0);
+                        }
                     }
                     sticks = Sticks::default();
                     update_name(&gilrs);

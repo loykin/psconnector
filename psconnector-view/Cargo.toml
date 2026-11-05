@@ -22,7 +22,15 @@ tokio.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
+# in-app PSN sign-in window (system web view)
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tao = "0.37.2"
+wry = "0.57.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
+# Edit menu for the sign-in window: on macOS, copy/paste shortcuts only work through the app menu
+muda = "0.21.2"
+block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-vision = "0.3.2"

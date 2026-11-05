@@ -1,6 +1,9 @@
 //! Command-line tool for manual checks.
 //!
 //! ```text
+//! cargo run -p psconnector --example rp -- discover                     find consoles on the network
+//! cargo run -p psconnector --example rp -- login                        PSN sign-in (prints a URL, reads the redirect)
+//! cargo run -p psconnector --example rp -- <host> register <PIN>        pair with the PS5 (needs `login` first)
 //! cargo run -p psconnector --example rp -- <host> status
 //! cargo run -p psconnector --example rp -- <host> connect [secs=10]     connect and hold without input
 //! cargo run -p psconnector --example rp -- <host> tap <button>...       tap buttons in order (e.g. tap right right cross)
@@ -13,12 +16,34 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use psconnector::{Button, Client, ddp};
+use psconnector::{Button, Client, ddp, profile, psn, register};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("discover") => {
+            for f in ddp::discover(Duration::from_secs(3)).await? {
+                let state = if f.status.is_on() { "on" } else { "rest mode" };
+                println!("{}  {}  {}  {state}", f.addr, f.name(), f.status.host_id().unwrap_or("?"));
+            }
+            return Ok(());
+        }
+        Some("login") => {
+            println!("1. Open this page and sign in to PSN:\n\n{}\n", psn::login_url());
+            println!(
+                "2. Paste the address of the page you land on (it starts with https://remoteplay.dl.playstation.net/remoteplay/redirect):"
+            );
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let acc = psn::account_from_redirect(&line).await?;
+            profile::save_account(&profile::default_path(), &acc.online_id, &acc.account_id)?;
+            println!("signed in as {} (saved to {})", acc.online_id, profile::default_path().display());
+            return Ok(());
+        }
+        _ => {}
+    }
     let host = args.first().ok_or_else(|| anyhow!("usage: rp <host> status|connect|tap|snap|wake|standby"))?;
     match args.get(1).map(String::as_str).unwrap_or("status") {
         "status" => {
@@ -90,6 +115,20 @@ async fn main() -> Result<()> {
             enc.write_header()?.write_image_data(&frame.rgb)?;
             println!("saved: {out}");
             c.close().await;
+        }
+        "register" => {
+            let pin = args.get(2).ok_or_else(|| anyhow!("usage: rp <host> register <8-digit PIN>"))?;
+            let path = profile::default_path();
+            let user = profile::users(&path).into_iter().next().ok_or_else(|| anyhow!("run `rp login` first"))?;
+            let st = ddp::status(host).await?;
+            let host_id = st.host_id().ok_or_else(|| anyhow!("console has no host-id"))?.to_string();
+            let data = register::register(host, &user.account_id, pin).await?;
+            profile::save_registration(&path, &user.online_id, &user.account_id, &host_id, &data)?;
+            println!(
+                "registered with {} ({host_id}) as {}",
+                data.get("Nickname").map(String::as_str).unwrap_or("PS5"),
+                user.online_id
+            );
         }
         "wake" => {
             let st = ddp::status(host).await?;

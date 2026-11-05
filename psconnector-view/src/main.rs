@@ -43,9 +43,12 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+mod login_window;
 mod ocr;
 mod pad;
 mod quality;
+mod settings;
+mod setup;
 mod sound;
 
 const DEFAULT_PORT: u16 = 8650;
@@ -79,10 +82,13 @@ struct Shared {
     muted: Arc<AtomicBool>,
     playing: AtomicBool,
     stop_play: AtomicBool,
-    /// On Ctrl+C or SIGTERM, close the window and end the session cleanly
-    quit: AtomicBool,
     /// The window's egui context, to wake it up from other threads
     ctx: std::sync::OnceLock<egui::Context>,
+    /// Disconnect was pressed: go back to the start screen
+    leave: AtomicBool,
+    /// The session is over; its threads and tasks stop
+    ended: AtomicBool,
+    serve_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Shared {
@@ -169,14 +175,10 @@ fn expand(p: &str) -> PathBuf {
     }
 }
 
-fn default_host() -> Option<String> {
-    // default console address saved by ps5rmtctl
-    let text = std::fs::read_to_string(home().join(".ps5rmtctl").join("config.json")).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    v["host"].as_str().map(str::to_string)
-}
-
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--login-window") {
+        login_window::run();
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut args = std::env::args().skip(1);
     let mut host = None;
@@ -224,82 +226,223 @@ fn main() -> Result<()> {
             _ => host = Some(a),
         }
     }
-    let host = host
-        .or_else(default_host)
-        .ok_or_else(|| anyhow!("usage: psconnector-view <PS5 address> [--port 8650] [--macros FILE] [--quality low|720p|1080p] [--bitrate KBPS] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]"))?;
     if autorun.is_none() && (!run_opts.is_empty() || run_at.is_some()) {
         bail!("--for, --after and --at go with --run MACRO");
     }
-
-    let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
-    let rt = tokio::runtime::Runtime::new()?;
-    println!("connecting to the PS5 at {}...", quality.label());
-    let opts = Options { audio: use_audio, stream: quality.stream(bitrate_kbps), ..Options::default() };
-    let client = Arc::new(rt.block_on(connect(&host, opts))?);
-    let muted = Arc::new(AtomicBool::new(start_muted));
-    let (audio_tx, audio_rx) = std::sync::mpsc::channel();
-    let sound = use_audio && sound::spawn(audio_rx, muted.clone());
     if macro_sources.is_empty() {
         macro_sources = default_macro_sources();
     }
-    let runner = Arc::new(Mutex::new(Runner::new(load_macros(&macro_sources), macro_sources, port)));
-    let shared = Arc::new(Shared {
-        client: std::sync::RwLock::new(client.clone()),
-        host: host.clone(),
-        quality: Mutex::new(quality),
-        bitrate_kbps,
+    let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
+    // turned off when signing out of an account that came from pyremoteplay
+    psconnector::profile::set_read_pyremoteplay(
+        settings::get("read_pyremoteplay").and_then(|v| v.as_bool()) != Some(false),
+    );
+    let launch = Launch {
+        port,
+        macro_sources,
+        autorun,
+        run_opts,
+        run_at,
+        use_pad,
         use_audio,
-        audio_out: sound.then_some(audio_tx),
-        reconnecting: Mutex::new(None),
-        rt: rt.handle().clone(),
-        runner: runner.clone(),
-        osd: Mutex::new(String::new()),
-        pad: Arc::new(Mutex::new(None)),
-        sound,
-        muted,
-        playing: AtomicBool::new(false),
-        stop_play: AtomicBool::new(false),
-        quit: AtomicBool::new(false),
-        ctx: std::sync::OnceLock::new(),
-    });
-    shared.attach_audio(&client);
-    if use_pad {
-        let sh = shared.clone();
-        pad::spawn(move || sh.client(), shared.pad.clone());
-    }
-    let sig = shared.clone();
-    rt.spawn(async move {
+        start_muted,
+        quality,
+        bitrate_kbps,
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.spawn(async {
         wait_for_quit_signal().await;
-        sig.quit.store(true, Ordering::SeqCst);
+        QUIT.store(true, Ordering::SeqCst);
     });
-    let listener = rt.block_on(TcpListener::bind(("127.0.0.1", port))).context("cannot open the command port")?;
-    rt.spawn(serve(listener, shared.clone()));
-    spawn_supervisor(shared.clone(), rt.handle().clone());
-    println!("connected. command port {port}. press Q in the window to quit");
-
-    if let Some(name) = autorun {
-        let msg = runner.lock().unwrap().run_named(&name, &Value::Object(run_opts), run_at.as_deref());
-        println!("--run {name}: {}", msg.map_err(|e| anyhow!("--run: {e}"))?);
-    }
+    // a console given on the command line, or else the one used last time, is connected to right away
+    let host = host.or_else(settings::last_host);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("PS5").with_inner_size([1280.0, 760.0]),
         ..Default::default()
     };
-    let app_shared = shared.clone();
+    let session: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
+    // sound output and the local pad live for the whole program, across connections
+    let muted = Arc::new(AtomicBool::new(launch.start_muted));
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+    let sound = launch.use_audio && sound::spawn(audio_rx, muted.clone());
+    let outputs = Outputs { audio: sound.then_some(audio_tx), muted, pad: Arc::new(Mutex::new(None)) };
+    if launch.use_pad {
+        let current = session.clone();
+        pad::spawn(move || current.lock().unwrap().as_ref().map(|s| s.client()), outputs.pad.clone());
+    }
+    let app_session = session.clone();
+    let handle = rt.handle().clone();
     let result = eframe::run_native(
         "psconnector-view",
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            let _ = app_shared.ctx.set(cc.egui_ctx.clone());
-            Ok(Box::new(Viewer { shared: app_shared, texture: None, shown: None, runner, fps: FpsMeter::default() }))
+            let setup = setup::Setup::new(handle.clone(), launch.options(launch.quality), host);
+            Ok(Box::new(App {
+                rt: handle,
+                launch,
+                outputs,
+                session: app_session,
+                state: State::Setup(Box::new(setup)),
+            }))
         }),
     );
-    shared.stop_play.store(true, Ordering::SeqCst);
-    shared.release_all();
-    rt.block_on(shared.client().close());
-    println!("closed");
+    let shared = session.lock().unwrap().take();
+    if let Some(shared) = shared {
+        shared.stop_play.store(true, Ordering::SeqCst);
+        shared.release_all();
+        rt.block_on(shared.client().close());
+        println!("closed");
+    }
     result.map_err(|e| anyhow!("window error: {e}"))
+}
+
+/// Set by Ctrl+C / SIGTERM: close the window and end the session cleanly.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Command-line choices, kept until a console is connected.
+struct Launch {
+    port: u16,
+    macro_sources: Vec<PathBuf>,
+    autorun: Option<String>,
+    run_opts: serde_json::Map<String, Value>,
+    run_at: Option<String>,
+    use_pad: bool,
+    use_audio: bool,
+    start_muted: bool,
+    quality: Quality,
+    bitrate_kbps: Option<u32>,
+}
+
+impl Launch {
+    fn options(&self, q: Quality) -> Options {
+        Options { audio: self.use_audio, stream: q.stream(self.bitrate_kbps), ..Options::default() }
+    }
+}
+
+/// Sound output and local pad, shared by every connection
+struct Outputs {
+    audio: Option<std::sync::mpsc::Sender<Audio>>,
+    muted: Arc<AtomicBool>,
+    pad: Arc<Mutex<Option<String>>>,
+}
+
+enum State {
+    /// Start screen: find, sign in, pair, wake, connect
+    Setup(Box<setup::Setup>),
+    Viewer(Box<Viewer>),
+}
+
+struct App {
+    rt: tokio::runtime::Handle,
+    launch: Launch,
+    outputs: Outputs,
+    /// The running session, also closed by main() after the window is gone
+    session: Arc<Mutex<Option<Arc<Shared>>>>,
+    state: State,
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        match &mut self.state {
+            State::Viewer(v) => {
+                v.ui(ui, frame);
+                if v.shared.leave.load(Ordering::SeqCst) {
+                    end_session(&self.rt, &v.shared);
+                    *self.session.lock().unwrap() = None;
+                    let opts = self.launch.options(*v.shared.quality.lock().unwrap());
+                    self.state = State::Setup(Box::new(setup::Setup::new(self.rt.clone(), opts, None)));
+                }
+            }
+            State::Setup(s) => {
+                if QUIT.load(Ordering::SeqCst) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if let Some((host, client)) = s.ui(ui) {
+                    match start_session(&self.rt, &self.launch, &self.outputs, host, client) {
+                        Ok((shared, runner)) => {
+                            let _ = shared.ctx.set(ctx.clone());
+                            *self.session.lock().unwrap() = Some(shared.clone());
+                            self.state = State::Viewer(Box::new(Viewer {
+                                shared,
+                                texture: None,
+                                shown: None,
+                                runner,
+                                fps: FpsMeter::default(),
+                            }));
+                        }
+                        Err(e) => {
+                            log::error!("{e:#}");
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Everything that runs once a console is connected: sound, pad, command port, macros.
+fn start_session(
+    rt: &tokio::runtime::Handle,
+    l: &Launch,
+    out: &Outputs,
+    host: String,
+    client: Client,
+) -> Result<(Arc<Shared>, Arc<Mutex<Runner>>)> {
+    let client = Arc::new(client);
+    let runner = Arc::new(Mutex::new(Runner::new(load_macros(&l.macro_sources), l.macro_sources.clone(), l.port)));
+    let shared = Arc::new(Shared {
+        client: std::sync::RwLock::new(client.clone()),
+        host,
+        quality: Mutex::new(l.quality),
+        bitrate_kbps: l.bitrate_kbps,
+        use_audio: l.use_audio,
+        audio_out: out.audio.clone(),
+        reconnecting: Mutex::new(None),
+        rt: rt.clone(),
+        runner: runner.clone(),
+        osd: Mutex::new(String::new()),
+        pad: out.pad.clone(),
+        sound: out.audio.is_some(),
+        muted: out.muted.clone(),
+        playing: AtomicBool::new(false),
+        stop_play: AtomicBool::new(false),
+        ctx: std::sync::OnceLock::new(),
+        leave: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+        serve_task: Mutex::new(None),
+    });
+    shared.attach_audio(&client);
+    let listener = rt
+        .block_on(TcpListener::bind(("127.0.0.1", l.port)))
+        .with_context(|| format!("cannot open the command port {}", l.port))?;
+    *shared.serve_task.lock().unwrap() = Some(rt.spawn(serve(listener, shared.clone())));
+    spawn_supervisor(shared.clone(), rt.clone());
+    println!("connected. command port {}. press Q in the window to quit", l.port);
+    if let Some(name) = &l.autorun {
+        let msg = runner.lock().unwrap().run_named(name, &Value::Object(l.run_opts.clone()), l.run_at.as_deref());
+        match msg {
+            Ok(m) => println!("--run {name}: {m}"),
+            Err(e) => println!("--run {name}: {e}"),
+        }
+    }
+    Ok((shared, runner))
+}
+
+/// Ends a session (Disconnect): stops its macro, frees the command port, and closes the connection.
+fn end_session(rt: &tokio::runtime::Handle, sh: &Arc<Shared>) {
+    sh.runner.lock().unwrap().shutdown();
+    sh.stop_play.store(true, Ordering::SeqCst);
+    sh.release_all();
+    sh.ended.store(true, Ordering::SeqCst);
+    if let Some(t) = sh.serve_task.lock().unwrap().take() {
+        t.abort();
+    }
+    let c = sh.client();
+    rt.spawn(async move { c.close().await });
+    println!("disconnected");
 }
 
 /// Runs macros' schedules and time limits, and handles a quit signal, off the window thread:
@@ -309,7 +452,7 @@ fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
         .name("supervisor".into())
         .spawn(move || {
             let mut quit_since: Option<Instant> = None;
-            loop {
+            while !sh.ended.load(Ordering::SeqCst) {
                 let ended = sh.runner.lock().unwrap().poll();
                 if let Some(ended) = ended {
                     // however the macro ended, release any input left pressed
@@ -319,7 +462,7 @@ fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
                         sh.client().standby();
                     }
                 }
-                if sh.quit.load(Ordering::SeqCst)
+                if QUIT.load(Ordering::SeqCst)
                     && let Some(ctx) = sh.ctx.get()
                 {
                     // the window closes on its next frame; make sure there is one
@@ -1061,6 +1204,14 @@ impl Viewer {
                 {
                     r.stop();
                     self.shared.client().standby();
+                    self.shared.leave.store(true, Ordering::SeqCst);
+                }
+                if ui
+                    .button("Disconnect")
+                    .on_hover_text("Close the connection and go back to the start screen")
+                    .clicked()
+                {
+                    self.shared.leave.store(true, Ordering::SeqCst);
                 }
                 if self.shared.sound {
                     let muted = self.shared.muted.load(Ordering::Relaxed);
@@ -1102,10 +1253,10 @@ impl Viewer {
     }
 }
 
-impl eframe::App for Viewer {
+impl Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let quit = self.shared.quit.load(Ordering::SeqCst);
+        let quit = QUIT.load(Ordering::SeqCst);
         if quit || ctx.input(|i| i.key_pressed(egui::Key::Q) && !i.modifiers.any()) {
             self.runner.lock().unwrap().shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

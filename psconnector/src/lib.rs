@@ -12,9 +12,11 @@
 //! # Ok(()) }
 //! ```
 
-// Public: console status and wake-up, reading registration data
+// Public: finding consoles and waking them, PSN login, PIN registration, registration data
 pub mod ddp;
 pub mod profile;
+pub mod psn;
+pub mod register;
 
 // Internals (protocol, crypto, packets). Only the needed types are re-exported below.
 mod audio;
@@ -46,7 +48,7 @@ pub use video::Frame;
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Registration file (default: ~/.pyremoteplay/.profile.json)
+    /// Registration file (default: ~/.psconnector/profile.json, then pyremoteplay's ~/.pyremoteplay/.profile.json)
     pub profile: Option<PathBuf>,
     /// Registered PSN user name (default: the first user registered with that console)
     pub user: Option<String>,
@@ -83,8 +85,10 @@ impl Client {
             return Err(Error::NotOn { code: st.code });
         }
         let host_id = st.host_id().ok_or_else(|| error::protocol("console response has no host-id"))?;
-        let path = opts.profile.clone().unwrap_or_else(profile::default_path);
-        let reg = profile::load(&path, opts.user.as_deref(), host_id)?;
+        let reg = match &opts.profile {
+            Some(path) => profile::load(path, opts.user.as_deref(), host_id)?,
+            None => profile::load_any(opts.user.as_deref(), host_id)?,
+        };
 
         let started = session::start(host, &reg).await?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
