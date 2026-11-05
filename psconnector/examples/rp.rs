@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         "wake" => {
             let st = ddp::status(host).await?;
             let host_id = st.host_id().ok_or_else(|| anyhow!("no host-id"))?;
-            let reg = psconnector::profile::load(&psconnector::profile::default_path(), None, host_id)?;
+            let reg = psconnector::profile::load_any(None, host_id)?;
             ddp::wakeup(host, &reg.regist_key).await?;
             println!("wake-up sent; the console takes 20-30 s to start");
         }
