@@ -28,7 +28,8 @@ It is a connection layer that lets game macros and AI assistants operate a PS5.
 | Local game controller (DualSense, ...) in psconnector-view | done (gilrs) |
 | Video (H.264 → RGB, 360p / 720p / 1080p) | done (openh264 in software, about 58 fps at 1080p on Apple Silicon). Frames with missing units are dropped and a key frame is requested. No FEC recovery yet |
 | Audio (Opus → PCM) | done (pure-Rust Opus decoder; lost packets are filled from the copies in the next ones, then by concealment) |
-| PSN login, PIN registration | not yet (reads the registration saved by pyremoteplay) |
+| Finding consoles on the network | done (DDP broadcast) |
+| PSN login, PIN registration | done, in the psconnector-view start screen (earlier pyremoteplay registrations are still read) |
 
 ## Design
 
@@ -50,7 +51,9 @@ Internal modules:
 | `video` | Video unit assembly, decoder thread (openh264) |
 | `audio` | Audio packets, frame order and loss recovery, Opus decoder thread |
 | `proto` | Takion protobuf messages |
-| `profile` | Reading registration data (`~/.pyremoteplay/.profile.json`) |
+| `profile` | Registration data (`~/.psconnector/profile.json`; also reads pyremoteplay's `~/.pyremoteplay/.profile.json`) |
+| `psn` | PSN sign-in through the browser, account id |
+| `register` | PIN registration with a PS5 |
 
 ## Library usage
 
@@ -76,15 +79,17 @@ cargo run -p psconnector --example rp -- 192.168.1.20 status
 cargo run -p psconnector --example rp -- 192.168.1.20 tap right right
 ```
 
-It supports `status`, `wake`, `connect [secs]`, `tap <button>...`, `snap [file]` and `standby`. Build with `--release`, because video decoding is slow in debug builds.
+It supports `discover`, `login`, `<host> register <PIN>`, `status`, `wake`, `connect [secs]`, `tap <button>...`, `snap [file]` and `standby`. Build with `--release`, because video decoding is slow in debug builds.
 
 ## psconnector-view (screen window + command port)
 
 Shows the PS5 screen in a window and opens a command port for macros (127.0.0.1:8650). It accepts the same commands as the earlier Python `ps5view.py`, so existing macros can switch connection layers without code changes.
 
 ```bash
-cargo run --release -p psconnector-view -- 192.168.1.20
+cargo run --release -p psconnector-view
 ```
+
+Without an address it opens the start screen (or reconnects to the console used last time); `psconnector-view 192.168.1.20` connects to that console directly.
 
 | Command (one JSON object per line) | Reply |
 |---|---|
@@ -138,7 +143,7 @@ Only `cmd` is required. The macro runs in its own folder, so relative paths work
 - Macros run as child processes. The port is passed in the `PSCONNECTOR_PORT` environment variable.
 - Stop sends SIGINT first (KeyboardInterrupt in Python) and kills the process if it has not exited after 3 seconds.
 - However a macro ends, psconnector-view releases every button and centers both sticks, so nothing stays pressed.
-- The bar shows the run time and the last line of the macro's output, with a rest-mode button on the right.
+- The bar shows the run time and the last line of the macro's output, with Rest mode and Disconnect on the right.
 - `--run NAME` starts a macro right away.
 
 #### Time limit, rest mode afterwards, start time
@@ -227,8 +232,18 @@ This produces `psconnector-view` and `psconnector-mcp` in `target/release/`. Rel
 
 ## Setup
 
-- Register once with pyremoteplay (for example via ps5rmtctl) to log in to PSN and pair the PS5. That registration data is read as is.
-- On macOS, the first run asks for local network access permission.
+Nothing else to install. Start `psconnector-view` without an address and its start screen walks through it:
+
+1. **Find**: consoles on the network are listed (on or in rest mode). An address can also be typed in.
+2. **Sign in to PSN** (once): Sony's sign-in page opens in a small window inside the app (the system web view: WebKit on macOS, WebView2 on Windows), in a private session that keeps nothing on disk. The password goes only to Sony; when Sony hands back the sign-in code, the window closes by itself. With **use the browser**, the page opens in your web browser instead and you paste the address you land on (`https://remoteplay.dl.playstation.net/remoteplay/redirect?code=...`) back into the app.
+3. **Pair** (once per console): on the PS5, Settings → System → Remote Play → Pair Device shows an 8-digit PIN; type it in.
+4. **Wake** a console in rest mode, or **Connect** to one that is on.
+
+**Disconnect** (or **Rest mode**) in the bar goes back to the start screen. There, **Sign out** removes the account and its pairings from this computer, and **Forget** removes one console's pairing (each asks once more first). The PS5 keeps this computer in Settings → System → Remote Play → Paired Devices until it is removed there.
+
+The pairing is saved in `~/.psconnector/profile.json` (readable only by you; it holds the keys to the console), and the last console in `~/.psconnector/settings.json`, so the next start connects straight away. A registration made earlier with pyremoteplay is used as well.
+
+On macOS, the first run asks for local network access permission.
 
 ## References
 

@@ -1,4 +1,4 @@
-//! DDP (Device Discovery Protocol): console status and wake-up.
+//! DDP (Device Discovery Protocol): finding consoles, their status, and wake-up.
 //!
 //! Sending the text `SRCH * HTTP/1.1` over UDP makes the console reply with `HTTP/1.1 200 Ok` (on)
 //! or `620 Server Standby` (rest mode), plus fields such as `host-id`.
@@ -42,6 +42,52 @@ pub async fn status(host: &str) -> Result<Status> {
         }
     }
     Err(Error::NoResponse { host: host.to_string() })
+}
+
+/// A console that answered a network-wide search.
+#[derive(Debug, Clone)]
+pub struct Found {
+    pub addr: std::net::IpAddr,
+    pub status: Status,
+}
+
+impl Found {
+    /// Name set on the console (Settings → System → System Software → Device Name)
+    pub fn name(&self) -> &str {
+        self.status.fields.get("host-name").map(String::as_str).unwrap_or("PS5")
+    }
+}
+
+/// Finds consoles on the local network: broadcasts a search and collects answers for `wait`.
+/// Consoles in rest mode answer too (`status.code` 620).
+pub async fn discover(wait: Duration) -> Result<Vec<Found>> {
+    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+    sock.set_broadcast(true)?;
+    let msg = format!("SRCH * HTTP/1.1\ndevice-discovery-protocol-version:{VERSION}\n");
+    let mut found: Vec<Found> = Vec::new();
+    let mut buf = [0u8; 2048];
+    let end = tokio::time::Instant::now() + wait;
+    let mut next_send = tokio::time::Instant::now();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= end {
+            break;
+        }
+        if now >= next_send {
+            // a few sends, since UDP broadcasts can be dropped
+            let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", PORT_PS5)).await;
+            next_send = now + Duration::from_millis(600);
+        }
+        let until = next_send.min(end);
+        if let Ok(Ok((n, from))) = tokio::time::timeout_at(until, sock.recv_from(&mut buf)).await
+            && let Ok(status) = parse(&buf[..n])
+            && status.host_id().is_some()
+            && !found.iter().any(|f| f.status.host_id() == status.host_id())
+        {
+            found.push(Found { addr: from.ip(), status });
+        }
+    }
+    Ok(found)
 }
 
 /// Wakes the console from rest mode. Needs the user credential derived from the regist key.

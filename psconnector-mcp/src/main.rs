@@ -9,7 +9,7 @@
 //! claude mcp add psconnector -- /path/to/psconnector-mcp --allow-input  # plus buttons, sticks, running macros, rest mode
 //! ```
 //! Options: `--port 8650` (psconnector-view command port), `--host 192.168.x.x` (for wake-up; defaults to the
-//! ps5rmtctl config)
+//! console psconnector-view connected to last)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -407,7 +407,7 @@ impl Psconnector {
             return ok_text("already on");
         }
         let host_id = tri!(st.host_id().map(str::to_string).ok_or_else(|| anyhow!("no host-id")));
-        let reg = tri!(psconnector::profile::load(&psconnector::profile::default_path(), None, &host_id));
+        let reg = tri!(psconnector::profile::load_any(None, &host_id));
         tri!(psconnector::ddp::wakeup(&host, &reg.regist_key).await);
         ok_text("wake-up sent")
     }
@@ -420,14 +420,22 @@ impl ServerHandler for Psconnector {
     }
 }
 
+/// psconnector-view's settings file (last console, whether pyremoteplay's registrations are read).
+fn view_settings() -> Value {
+    std::env::home_dir()
+        .and_then(|h| std::fs::read_to_string(h.join(".psconnector").join("settings.json")).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The console psconnector-view connected to last.
 fn default_host() -> Option<String> {
-    let home = std::env::home_dir()?;
-    let text = std::fs::read_to_string(home.join(".ps5rmtctl").join("config.json")).ok()?;
-    serde_json::from_str::<Value>(&text).ok()?["host"].as_str().map(str::to_string)
+    view_settings()["host"].as_str().map(str::to_string)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    psconnector::profile::set_read_pyremoteplay(view_settings()["read_pyremoteplay"].as_bool() != Some(false));
     let mut args = std::env::args().skip(1);
     let (mut port, mut host, mut allow_input) = (8650u16, None, false);
     while let Some(a) = args.next() {
