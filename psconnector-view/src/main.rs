@@ -50,6 +50,7 @@ mod quality;
 mod settings;
 mod setup;
 mod sound;
+mod theme;
 
 const DEFAULT_PORT: u16 = 8650;
 /// System font with Korean glyphs (falls back to egui's default font if missing)
@@ -277,6 +278,7 @@ fn main() -> Result<()> {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx);
             let setup = setup::Setup::new(handle.clone(), launch.options(launch.quality), host);
             Ok(Box::new(App {
                 rt: handle,
@@ -1103,6 +1105,10 @@ impl FpsMeter {
 
 impl Viewer {
     fn bar(&mut self, ui: &mut egui::Ui) {
+        // the bar holds many controls: tighter than the rest of the window
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_space(2.0);
         let runner = self.runner.clone();
         let mut r = runner.lock().unwrap();
         let r = &mut *r;
@@ -1147,7 +1153,7 @@ impl Viewer {
                     .on_hover_text("What to do when the macro ends by itself or at its time limit (not on ■ Stop)");
             });
             if !idle {
-                if ui.button("■ Stop").clicked() {
+                if theme::destructive(ui, true, "■ Stop").clicked() {
                     r.stop();
                 }
             } else if waiting {
@@ -1155,7 +1161,7 @@ impl Viewer {
                     r.cancel_schedule();
                 }
             } else {
-                if ui.add_enabled(!names.is_empty(), egui::Button::new("▶ Run")).clicked() {
+                if theme::primary(ui, !names.is_empty(), "▶ Run").clicked() {
                     r.start();
                 }
                 ui.add(egui::TextEdit::singleline(&mut r.at_text).hint_text("HH:MM").desired_width(60.0))
@@ -1166,7 +1172,7 @@ impl Viewer {
                 {
                     r.schedule_selected();
                 }
-                if ui.button("Reload list").clicked() {
+                if theme::ghost(ui, true, "Reload list").clicked() {
                     r.reload();
                 }
             }
@@ -1200,14 +1206,15 @@ impl Viewer {
             let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
             ui.add(egui::Label::new(egui::RichText::new(last).weak()).truncate());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Rest mode").on_hover_text("Put the PS5 into rest mode (this also disconnects)").clicked()
+                if theme::ghost(ui, true, "Rest mode")
+                    .on_hover_text("Put the PS5 into rest mode (this also disconnects)")
+                    .clicked()
                 {
                     r.stop();
                     self.shared.client().standby();
                     self.shared.leave.store(true, Ordering::SeqCst);
                 }
-                if ui
-                    .button("Disconnect")
+                if theme::ghost(ui, true, "Disconnect")
                     .on_hover_text("Close the connection and go back to the start screen")
                     .clicked()
                 {
