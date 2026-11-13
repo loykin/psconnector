@@ -1203,7 +1203,13 @@ impl Viewer {
         let runner = self.runner.clone();
         let mut r = runner.lock().unwrap();
         let r = &mut *r;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if theme::ghost(ui, true, "🎨 Picture")
+                .on_hover_text("Brightness, contrast, colour range and saved game presets")
+                .clicked()
+            {
+                self.picture_open = !self.picture_open;
+            }
             let names: Vec<String> = match &r.macros {
                 Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
                 Err(_) => Vec::new(),
@@ -1304,12 +1310,6 @@ impl Viewer {
                     r.stop();
                     self.shared.client().standby();
                     self.shared.leave.store(true, Ordering::SeqCst);
-                }
-                if theme::ghost(ui, true, "Picture")
-                    .on_hover_text("Brightness, contrast and colour of the picture")
-                    .clicked()
-                {
-                    self.picture_open = !self.picture_open;
                 }
                 if theme::ghost(ui, true, "Disconnect")
                     .on_hover_text("Close the connection and go back to the start screen")
