@@ -14,6 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 
+use crate::VideoCodec;
 use crate::audio::{self, AudioConfig, AudioMsg, AudioTx, Reorder};
 use crate::controller::{Button, EventHistory, Sticks};
 use crate::gkcrypt::{Ecdh, StreamCipher};
@@ -63,6 +64,7 @@ pub type VideoTx = std::sync::mpsc::Sender<(u16, std::time::Instant, Vec<u8>)>;
 pub(crate) struct Outputs {
     pub video: Option<(VideoTx, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     pub audio: Option<AudioTx>,
+    pub video_codec: VideoCodec,
 }
 
 struct AudioState {
@@ -189,7 +191,8 @@ pub enum Phase {
     Closed(String),
 }
 
-fn launch_spec(cfg: &StreamConfig, handshake_key: &[u8; 16]) -> String {
+fn launch_spec(cfg: &StreamConfig, handshake_key: &[u8; 16], codec: VideoCodec) -> String {
+    let (video_codec, dynamic_range) = codec.launch_values();
     format!(
         concat!(
             r#"{{"sessionId":"sessionId4321","streamResolutions":[{{"resolution":{{"width":{},"height":{}}},"maxFps":{},"score":10}}],"#,
@@ -198,12 +201,14 @@ fn launch_spec(cfg: &StreamConfig, handshake_key: &[u8; 16]) -> String {
             r#""konan":{{"ps3AccessToken":"accessToken","ps3RefreshToken":"refreshToken"}},"#,
             r#""requestGameSpecification":{{"model":"bravia_tv","platform":"android","audioChannels":"5.1","language":"sp","acceptButton":"X","connectedControllers":["xinput","ds3","ds4"],"yuvCoefficient":"bt709","videoEncoderProfile":"hw4.1","audioEncoderProfile":"audio1","adaptiveStreamMode":"resize"}},"#,
             r#""userProfile":{{"onlineId":"psnId","npId":"npId","region":"US","languagesUsed":["en","jp"]}},"#,
-            r#""videoCodec":"avc","dynamicRange":"SDR","handshakeKey":"{}"}}"#,
+            r#""videoCodec":"{}","dynamicRange":"{}","handshakeKey":"{}"}}"#,
         ),
         cfg.width,
         cfg.height,
         cfg.fps,
         cfg.bitrate_kbps,
+        video_codec,
+        dynamic_range,
         B64.encode(handshake_key),
     )
 }
@@ -417,6 +422,7 @@ pub async fn run(
         debug!("cannot enlarge the UDP receive buffer: {e}");
     }
     sock.connect((host.as_str(), PORT)).await?;
+    let video_codec = out.video_codec;
     let mut s = Stream {
         sock,
         tsn: 1,
@@ -496,7 +502,7 @@ pub async fn run(
                         s.control(chunk::COOKIE, &cookie, 0).await;
                     }
                     chunk::COOKIE_ACK => {
-                        let spec = launch_spec(&cfg, &s.ecdh.handshake_key);
+                        let spec = launch_spec(&cfg, &s.ecdh.handshake_key, video_codec);
                         let mut spec = spec.into_bytes();
                         spec.push(0);
                         let ks = launch.encrypt_at(0, &vec![0u8; spec.len()]);

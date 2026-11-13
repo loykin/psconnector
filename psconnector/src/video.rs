@@ -20,6 +20,8 @@ use openh264::formats::YUVSource;
 use rayon::prelude::*;
 use tokio::sync::watch;
 
+use crate::VideoCodec;
+
 /// One decoded frame (8-bit RGB, row-major).
 #[derive(Clone)]
 pub struct Frame {
@@ -501,6 +503,69 @@ pub fn spawn_decoder(
     out: watch::Sender<Option<Arc<Frame>>>,
     need_key: Arc<std::sync::atomic::AtomicBool>,
     range: Arc<std::sync::atomic::AtomicU8>,
+    codec: VideoCodec,
+) -> std::thread::JoinHandle<()> {
+    match codec {
+        VideoCodec::H264 => spawn_h264_decoder(rx, out, need_key, range),
+        VideoCodec::H265 => spawn_hevc_decoder(rx, out, need_key, false),
+        VideoCodec::H265Hdr => spawn_hevc_decoder(rx, out, need_key, true),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hdr_sdr_lut() -> [u8; 256] {
+    // VideoToolbox has already converted the HDR YUV surface to display-referred BGRA.
+    // Its 8-bit result keeps the highlights but looks dim on an SDR egui surface, so lift
+    // the mid/high range without moving black or hard-clipping the shoulder.
+    const ANCHORS: &[(u8, u8)] = &[
+        (0, 0),
+        (32, 20),
+        (64, 55),
+        (80, 85),
+        (96, 115),
+        (112, 145),
+        (128, 175),
+        (144, 200),
+        (160, 220),
+        (192, 245),
+        (255, 255),
+    ];
+    let mut lut = [0; 256];
+    for pair in ANCHORS.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        for x in x0..=x1 {
+            let t = (x - x0) as f32 / (x1 - x0) as f32;
+            lut[x as usize] = (y0 as f32 + t * (y1 as f32 - y0 as f32)).round() as u8;
+        }
+    }
+    lut
+}
+
+#[cfg(target_os = "macos")]
+fn hdr_bgra_to_sdr_rgb(src: &[u8], dst: &mut [u8], lut: &[u8; 256]) {
+    src.par_chunks_exact(4).zip(dst.par_chunks_exact_mut(3)).for_each(|(src, dst)| {
+        let mut r = lut[src[2] as usize] as f32;
+        let mut g = lut[src[1] as usize] as f32;
+        let mut b = lut[src[0] as usize] as f32;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        // The 8-bit VideoToolbox conversion loses some chroma in HDR midtones. Restore it
+        // gently, fading the correction out near white so highlights remain neutral.
+        let saturation = 1.0 + 0.20 * (1.0 - luma / 255.0);
+        r = luma + (r - luma) * saturation;
+        g = luma + (g - luma) * saturation;
+        b = luma + (b - luma) * saturation;
+        dst[0] = r.clamp(0.0, 255.0).round() as u8;
+        dst[1] = g.clamp(0.0, 255.0).round() as u8;
+        dst[2] = b.clamp(0.0, 255.0).round() as u8;
+    });
+}
+
+fn spawn_h264_decoder(
+    rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
+    out: watch::Sender<Option<Arc<Frame>>>,
+    need_key: Arc<std::sync::atomic::AtomicBool>,
+    range: Arc<std::sync::atomic::AtomicU8>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("psconnector-video".into())
@@ -624,6 +689,95 @@ pub fn spawn_decoder(
         .expect("video thread")
 }
 
+#[cfg(target_os = "macos")]
+fn spawn_hevc_decoder(
+    rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
+    out: watch::Sender<Option<Arc<Frame>>>,
+    need_key: Arc<std::sync::atomic::AtomicBool>,
+    hdr: bool,
+) -> std::thread::JoinHandle<()> {
+    use macos_media_toolkit::videotoolbox::{DecodeError, DecoderConfig, HevcDecoder};
+
+    std::thread::Builder::new()
+        .name("psconnector-hevc".into())
+        .spawn(move || {
+            let mut decoder = HevcDecoder::new(&DecoderConfig::default());
+            let mut rgb = Vec::new();
+            let mut stats = DecodeStats::default();
+            let hdr_lut = hdr.then(hdr_sdr_lut);
+            let mut next = rx.recv().ok();
+            let mut announced = false;
+            while let Some((index, queued_at, access_unit)) = next.take() {
+                let queued = queued_at.elapsed();
+                let t0 = std::time::Instant::now();
+                let decoded = decoder.decode(&access_unit);
+                let t_decode = t0.elapsed();
+                let waiting = rx.try_recv();
+                let behind = waiting.is_ok();
+                match decoded {
+                    Ok(decoded) if !behind => {
+                        let t1 = std::time::Instant::now();
+                        let frame = decoded.frame;
+                        let width = frame.width as usize;
+                        let height = frame.height as usize;
+                        rgb.resize(width * height * 3, 0);
+                        if let Some(lut) = &hdr_lut {
+                            hdr_bgra_to_sdr_rgb(&frame.bgra, &mut rgb, lut);
+                        } else {
+                            frame.bgra.par_chunks_exact(4).zip(rgb.par_chunks_exact_mut(3)).for_each(|(src, dst)| {
+                                dst[0] = src[2];
+                                dst[1] = src[1];
+                                dst[2] = src[0];
+                            });
+                        }
+                        if !announced {
+                            log::info!(
+                                "HEVC decoded by VideoToolbox: {}x{} BGRA ({})",
+                                width,
+                                height,
+                                if hdr { "HDR mapped to SDR display" } else { "SDR" }
+                            );
+                            announced = true;
+                        }
+                        out.send_replace(Some(Arc::new(Frame { width, height, rgb: std::mem::take(&mut rgb), index })));
+                        stats.shown += 1;
+                        stats.convert += t1.elapsed();
+                    }
+                    Ok(_) => stats.skipped += u32::from(behind),
+                    Err(DecodeError::MissingKeyframe) => {
+                        need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(DecodeError::Frame(e) | DecodeError::Fatal(e)) => {
+                        warn!("HEVC decode failed: {e}");
+                        decoder.reset();
+                        need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                stats.decoded += 1;
+                stats.queue += queued;
+                stats.max_queue = stats.max_queue.max(queued);
+                stats.decode += t_decode;
+                stats.report();
+                next = match waiting {
+                    Ok(f) => Some(f),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => rx.recv().ok(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                };
+            }
+        })
+        .expect("HEVC video thread")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_hevc_decoder(
+    _rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
+    _out: watch::Sender<Option<Arc<Frame>>>,
+    _need_key: Arc<std::sync::atomic::AtomicBool>,
+    _hdr: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| warn!("H.265 decoding is not available on this platform"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +854,13 @@ mod tests {
         );
         assert_eq!(&rgb[0..3], &[0, 0, 0]);
         assert_eq!(&rgb[3..6], &[255, 255, 255]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hdr_display_curve_preserves_endpoints_and_never_reverses() {
+        let lut = hdr_sdr_lut();
+        assert_eq!((lut[0], lut[255]), (0, 255));
+        assert!(lut.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 }

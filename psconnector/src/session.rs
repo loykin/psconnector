@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::VideoCodec;
 use crate::profile::{Registration, hex};
 use crate::rpcrypt::{self, SessionCipher};
 
@@ -22,7 +23,6 @@ const USER_AGENT: &str = "remoteplay Windows";
 const OS_TYPE: &str = "Win10.0.0";
 const RP_VERSION_PS5: &str = "1.0";
 const DID_PREFIX: [u8; 10] = [0x00, 0x18, 0x00, 0x00, 0x00, 0x07, 0x00, 0x40, 0x00, 0x80];
-const STREAM_TYPE_H264: u32 = 1;
 
 mod msg {
     pub const SESSION_ID: u16 = 0x33;
@@ -108,7 +108,7 @@ fn rejection(stage: &str, resp: &Response) -> Error {
     Error::Rejected(format!("{stage}: {why}"))
 }
 
-pub async fn start(host: &str, reg: &Registration) -> Result<Started> {
+pub async fn start(host: &str, reg: &Registration, video_codec: VideoCodec) -> Result<Started> {
     if reg.host_type != "PS5" {
         return Err(Error::Unsupported(format!("only PS5 is supported ({})", reg.host_type)));
     }
@@ -159,7 +159,7 @@ pub async fn start(host: &str, reg: &Registration) -> Result<Started> {
         ("RP-OSType", enc(&os)),
         ("RP-ConPath", "1".into()),
         ("RP-StartBitrate", enc(&[0; 4])),
-        ("RP-StreamingType", enc(&STREAM_TYPE_H264.to_le_bytes())),
+        ("RP-StreamingType", enc(&video_codec.streaming_type().to_le_bytes())),
     ];
     let mut sock = TcpStream::connect((host, PORT)).await?;
     let resp = request(&mut sock, host, "/sie/ps5/rp/sess/ctrl", &headers).await?;

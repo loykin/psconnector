@@ -857,6 +857,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cidre"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9a2eb741d079bcf0b7563d1616df85716005cac263484ef457e2f7234541f23"
+dependencies = [
+ "cc",
+ "cidre-macros",
+ "half",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "cidre-macros"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f32b3f1473b6147c2cf3a3f76ad680f49c95fb36a0292425af5e019132f3236"
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3246,6 +3265,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "macos-media-toolkit"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "715da1dbd5236f627dec855d4d5aa4a9934dadae29bfd579e22baaad0cf7858a"
+dependencies = [
+ "anyhow",
+ "cidre",
+ "log",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4647,6 +4678,7 @@ dependencies = [
  "hmac 0.12.1",
  "k256",
  "log",
+ "macos-media-toolkit",
  "openh264",
  "opus-decoder",
  "png",

@@ -47,6 +47,33 @@ pub use stream::{Phase, StreamConfig};
 pub use video::Frame;
 pub use video::VideoRange;
 
+/// Video stream requested from the PS5.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    H265,
+    H265Hdr,
+}
+
+impl VideoCodec {
+    pub(crate) const fn streaming_type(self) -> u32 {
+        match self {
+            Self::H264 => 1,
+            Self::H265 => 2,
+            Self::H265Hdr => 3,
+        }
+    }
+
+    pub(crate) const fn launch_values(self) -> (&'static str, &'static str) {
+        match self {
+            Self::H264 => ("avc", "SDR"),
+            Self::H265 => ("hevc", "SDR"),
+            Self::H265Hdr => ("hevc", "HDR"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Registration file (default: ~/.psconnector/profile.json, then pyremoteplay's ~/.pyremoteplay/.profile.json)
@@ -60,6 +87,8 @@ pub struct Options {
     pub audio: bool,
     /// YUV sample range. Auto follows H.264 metadata; overrides help streams with incorrect VUI flags.
     pub video_range: VideoRange,
+    /// H.264 SDR, H.265 SDR, or H.265 HDR (PS5 only).
+    pub video_codec: VideoCodec,
 }
 
 impl Default for Options {
@@ -71,6 +100,7 @@ impl Default for Options {
             video: true,
             audio: false,
             video_range: VideoRange::Auto,
+            video_codec: VideoCodec::H264,
         }
     }
 }
@@ -101,7 +131,11 @@ impl Client {
             None => profile::load_any(opts.user.as_deref(), host_id)?,
         };
 
-        let started = session::start(host, &reg).await?;
+        #[cfg(not(target_os = "macos"))]
+        if opts.video_codec != VideoCodec::H264 {
+            return Err(Error::Unsupported("H.265 decoding is currently available on macOS only".into()));
+        }
+        let started = session::start(host, &reg, opts.video_codec).await?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (phase_tx, mut phase_rx) = watch::channel(Phase::Connecting);
         let (frame_tx, frame_rx) = watch::channel(None);
@@ -109,7 +143,7 @@ impl Client {
         let (video_tx, cfg) = if opts.video {
             let (tx, rx) = std::sync::mpsc::channel();
             let need_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            video::spawn_decoder(rx, frame_tx, need_key.clone(), video_range.clone());
+            video::spawn_decoder(rx, frame_tx, need_key.clone(), video_range.clone(), opts.video_codec);
             (Some((tx, need_key)), opts.stream)
         } else {
             (None, StreamConfig::minimal())
@@ -130,7 +164,7 @@ impl Client {
             cfg,
             cmd_rx,
             phase_tx,
-            stream::Outputs { video: video_tx, audio: audio_tx },
+            stream::Outputs { video: video_tx, audio: audio_tx, video_codec: opts.video_codec },
         ));
         let phase =
             match tokio::time::timeout(Duration::from_secs(15), phase_rx.wait_for(|p| *p != Phase::Connecting)).await {

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use eframe::egui;
-use psconnector::{Audio, Button, Client, Frame, Options, VideoRange};
+use psconnector::{Audio, Button, Client, Frame, Options, VideoCodec, VideoRange};
 use quality::Quality;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -68,6 +68,7 @@ struct Shared {
     client: std::sync::RwLock<Arc<Client>>,
     host: String,
     quality: Mutex<Quality>,
+    video_codec: Mutex<VideoCodec>,
     video_range: Mutex<VideoRange>,
     bitrate_kbps: Option<u32>,
     use_audio: bool,
@@ -127,11 +128,12 @@ impl Shared {
         c.stick(true, 0.0, 0.0);
     }
 
-    fn options(&self, q: Quality) -> Options {
+    fn options(&self, q: Quality, codec: VideoCodec) -> Options {
         Options {
             audio: self.use_audio,
             stream: q.stream(self.bitrate_kbps),
             video_range: *self.video_range.lock().unwrap(),
+            video_codec: codec,
             ..Options::default()
         }
     }
@@ -150,8 +152,8 @@ impl Shared {
     }
 
     /// Reconnects at another quality (no-op if already there).
-    fn set_quality(self: &Arc<Self>, q: Quality) -> Result<(), String> {
-        if *self.quality.lock().unwrap() == q {
+    fn reconnect(self: &Arc<Self>, q: Quality, codec: VideoCodec) -> Result<(), String> {
+        if *self.quality.lock().unwrap() == q && *self.video_codec.lock().unwrap() == codec {
             return Ok(());
         }
         {
@@ -159,34 +161,55 @@ impl Shared {
             if r.as_deref().is_some_and(|n| n.starts_with("reconnecting")) {
                 return Err("already reconnecting".into());
             }
-            *r = Some(format!("reconnecting at {}...", q.label()));
+            *r = Some(format!("reconnecting at {} / {}...", q.label(), video_codec_name(codec)));
         }
         let sh = self.clone();
         self.rt.spawn(async move {
             sh.release_all();
             let old_q = *sh.quality.lock().unwrap();
+            let old_codec = *sh.video_codec.lock().unwrap();
             sh.client().close().await;
-            // the console needs a moment to drop the old session; connect() retries while it is busy
-            let result = match connect(&sh.host, sh.options(q)).await {
-                Ok(c) => Ok((c, q)),
+            // Give the console time to release the old streaming slot. Reconnecting immediately can be accepted
+            // while the previous stream is still draining, which produces long packet bursts and audio gaps.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let result = match connect(&sh.host, sh.options(q, codec)).await {
+                Ok(c) => Ok((c, q, codec)),
                 Err(e) => {
-                    log::warn!("reconnect at {} failed: {e:#}; going back to {}", q.label(), old_q.label());
-                    connect(&sh.host, sh.options(old_q)).await.map(|c| (c, old_q))
+                    log::warn!(
+                        "reconnect at {} / {} failed: {e:#}; going back to {} / {}",
+                        q.label(),
+                        video_codec_name(codec),
+                        old_q.label(),
+                        video_codec_name(old_codec)
+                    );
+                    connect(&sh.host, sh.options(old_q, old_codec)).await.map(|c| (c, old_q, old_codec))
                 }
             };
             match result {
-                Ok((c, got)) => {
+                Ok((c, got, got_codec)) => {
                     sh.attach_audio(&c);
                     *sh.client.write().unwrap() = Arc::new(c);
                     *sh.quality.lock().unwrap() = got;
+                    *sh.video_codec.lock().unwrap() = got_codec;
                     quality::save(got);
-                    log::info!("connected at {}", got.label());
+                    settings::set("video_codec", Value::String(video_codec_name(got_codec).into()));
+                    log::info!("connected at {} / {}", got.label(), video_codec_name(got_codec));
                     *sh.reconnecting.lock().unwrap() = None;
                 }
                 Err(e) => *sh.reconnecting.lock().unwrap() = Some(format!("reconnect failed: {e:#}")),
             }
         });
         Ok(())
+    }
+
+    fn set_quality(self: &Arc<Self>, q: Quality) -> Result<(), String> {
+        let codec = *self.video_codec.lock().unwrap();
+        self.reconnect(q, codec)
+    }
+
+    fn set_video_codec(self: &Arc<Self>, codec: VideoCodec) -> Result<(), String> {
+        let quality = *self.quality.lock().unwrap();
+        self.reconnect(quality, codec)
     }
 }
 
@@ -260,6 +283,8 @@ fn main() -> Result<()> {
         macro_sources = default_macro_sources();
     }
     let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
+    let video_codec =
+        settings::get("video_codec").and_then(|v| v.as_str().and_then(parse_video_codec)).unwrap_or(VideoCodec::H264);
     let video_range =
         settings::get("video_range").and_then(|v| v.as_str().and_then(parse_video_range)).unwrap_or(VideoRange::Auto);
     // turned off when signing out of an account that came from pyremoteplay
@@ -277,6 +302,7 @@ fn main() -> Result<()> {
         start_muted,
         quality,
         bitrate_kbps,
+        video_codec,
         video_range,
     };
     let rt = tokio::runtime::Runtime::new()?;
@@ -343,6 +369,7 @@ struct Launch {
     start_muted: bool,
     quality: Quality,
     bitrate_kbps: Option<u32>,
+    video_codec: VideoCodec,
     video_range: VideoRange,
 }
 
@@ -352,6 +379,7 @@ impl Launch {
             audio: self.use_audio,
             stream: q.stream(self.bitrate_kbps),
             video_range: self.video_range,
+            video_codec: self.video_codec,
             ..Options::default()
         }
     }
@@ -362,6 +390,23 @@ fn video_range_name(range: VideoRange) -> &'static str {
         VideoRange::Auto => "auto",
         VideoRange::Limited => "limited",
         VideoRange::Full => "full",
+    }
+}
+
+fn video_codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "h265",
+        VideoCodec::H265Hdr => "h265-hdr",
+    }
+}
+
+fn parse_video_codec(name: &str) -> Option<VideoCodec> {
+    match name.to_ascii_lowercase().as_str() {
+        "h264" | "avc" => Some(VideoCodec::H264),
+        "h265" | "hevc" => Some(VideoCodec::H265),
+        "h265-hdr" | "hevc-hdr" | "hdr" => Some(VideoCodec::H265Hdr),
+        _ => None,
     }
 }
 
@@ -457,6 +502,7 @@ fn start_session(
         client: std::sync::RwLock::new(client.clone()),
         host,
         quality: Mutex::new(l.quality),
+        video_codec: Mutex::new(l.video_codec),
         video_range: Mutex::new(l.video_range),
         bitrate_kbps: l.bitrate_kbps,
         use_audio: l.use_audio,
@@ -1381,6 +1427,22 @@ impl Viewer {
         let before = p;
         egui::Window::new("Picture").open(&mut open).resizable(false).default_width(300.0).show(ctx, |ui| {
             ui.label(theme::muted(ui, "Changes only what you see here; macros and screenshots get the original."));
+            let current_codec = *self.shared.video_codec.lock().unwrap();
+            let mut chosen_codec = current_codec;
+            ui.horizontal(|ui| {
+                ui.label("Stream codec");
+                egui::ComboBox::from_id_salt("video_codec").selected_text(video_codec_name(current_codec)).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut chosen_codec, VideoCodec::H264, "H.264 SDR");
+                        ui.selectable_value(&mut chosen_codec, VideoCodec::H265, "H.265 SDR");
+                        ui.selectable_value(&mut chosen_codec, VideoCodec::H265Hdr, "H.265 HDR (tone-mapped)");
+                    },
+                );
+            });
+            if chosen_codec != current_codec {
+                let _ = self.shared.set_video_codec(chosen_codec);
+            }
             let current_range = *self.shared.video_range.lock().unwrap();
             let mut chosen_range = current_range;
             ui.horizontal(|ui| {
@@ -1729,6 +1791,13 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
                 "height": f.as_ref().map(|f| f.height),
             })
         )));
+    } else if let Some(name) = m["video_codec"].as_str() {
+        if !name.is_empty() {
+            let codec = parse_video_codec(name).ok_or_else(|| anyhow!("video_codec must be h264, h265 or h265-hdr"))?;
+            sh.set_video_codec(codec).map_err(|e| anyhow!(e))?;
+            return Ok(Reply::Text(format!("ok reconnecting {}", video_codec_name(codec))));
+        }
+        return Ok(Reply::Text(format!("ok {}", video_codec_name(*sh.video_codec.lock().unwrap()))));
     } else if let Some(name) = m["video_range"].as_str() {
         if !name.is_empty() {
             let range = parse_video_range(name).ok_or_else(|| anyhow!("video_range must be auto, limited or full"))?;

@@ -108,6 +108,7 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
 | `{"input_bench":{}}` / `{"input_bench":{"seconds":12,"interval_ms":10,"burst":4}}` generate below-dead-zone input for latency statistics | `ok input benchmark started ...` |
 | `{"picture_snap":"/tmp/shown.png"}` save the current frame with the window's picture adjustment applied | `ok` |
+| `{"video_codec":"h264|h265|h265-hdr"}` reconnect with another stream codec (`""` only reports) | `ok reconnecting h265-hdr` |
 | `{"video_range":"auto|limited|full"}` override incorrect H.264 range metadata (`""` only reports) | `ok full` |
 | `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"saved preset name"}` picture adjustment (`""` only reports) | `ok {values}` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
@@ -123,6 +124,8 @@ A game controller connected to the computer (DualSense over USB or Bluetooth, Xb
 | `1080p` | 1920x1080, 60 fps, 15 Mbit/s | playing yourself |
 
 The resolution is agreed when connecting, so changing it in the bar reconnects. The console usually releases the old session within a few seconds, but it can occasionally take more than a minute, so expect a wait without a picture. The choice is remembered in `~/.psconnector/settings.json`. Macros keep working across a change: OCR with `rel=` fractions and MCP screenshot regions (always in 1280x720 space) do not depend on the resolution.
+
+On macOS, **Picture → Stream codec** can request H.264 SDR, hardware-decoded H.265 SDR, or H.265 HDR. The HDR stream is converted to the SDR window with a highlight-preserving display curve; this keeps the HDR source's highlight detail but is not native HDR monitor output. Codec changes reconnect and are remembered. H.265 decoding is currently macOS-only.
 
 **Picture** in the bar opens brightness controls for the window: shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved by name. It helps games whose image is too contrasty, such as Like a Dragon: Infinite Wealth in Hawaii (preset "Like a Dragon: Hawaii"). Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back. The command port takes `{"picture": {"shadows": 0.5, ...}}` or `{"picture": "preset name"}`.
 
