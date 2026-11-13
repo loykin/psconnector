@@ -6,6 +6,7 @@
 //! Very dark pixels get their lift as neutral grey instead of a large multiplier, which would otherwise
 //! blow up compression noise into coloured blotches.
 
+use eframe::egui::Color32;
 use rayon::prelude::*;
 use serde_json::{Value, json};
 
@@ -130,7 +131,7 @@ impl Lut {
         }
     }
 
-    fn pixel(&self, px: &[u8], out: &mut [u8]) {
+    fn pixel(&self, px: &[u8]) -> [u8; 3] {
         let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
         let y = ((54 * r + 183 * g + 19 * b) >> 8) as usize;
         let (k, off, t) = (self.gain[y], self.offset[y], self.target[y]);
@@ -143,22 +144,31 @@ impl Lut {
         }
         c[0] = (c[0] * self.red) >> 8;
         c[2] = (c[2] * self.blue) >> 8;
-        for (o, v) in out.iter_mut().zip(c) {
-            *o = v.clamp(0, 255) as u8;
-        }
+        c.map(|v| v.clamp(0, 255) as u8)
     }
 
     /// Adjusts an RGB frame into `out` (resized as needed). Rayon keeps its worker threads alive between
     /// frames; creating scoped OS threads here cost a surprising amount at 60 fps.
     pub fn apply(&self, src: &[u8], out: &mut Vec<u8>) {
         out.resize(src.len(), 0);
-        let threads = std::thread::available_parallelism().map(|n| n.get().min(4)).unwrap_or(2);
+        let threads = std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(2);
         let chunk = (src.len() / 3).div_ceil(threads) * 3;
         src.par_chunks(chunk.max(3)).zip(out.par_chunks_mut(chunk.max(3))).for_each(|(sc, oc)| {
             for (p, o) in sc.as_chunks::<3>().0.iter().zip(oc.as_chunks_mut::<3>().0.iter_mut()) {
-                self.pixel(p, o);
+                *o = self.pixel(p);
             }
         });
+    }
+
+    /// Applies the adjustment directly into egui's RGBA pixel format, avoiding a second
+    /// full-frame RGB→RGBA conversion and the intermediate adjusted RGB buffer.
+    pub fn apply_color32(&self, src: &[u8]) -> Vec<Color32> {
+        src.par_chunks_exact(3)
+            .map(|p| {
+                let rgb = self.pixel(p);
+                Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+            })
+            .collect()
     }
 }
 
@@ -174,6 +184,21 @@ mod tests {
         lut.apply(&src, &mut out);
         let worst = src.iter().zip(&out).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         assert!(worst <= 2, "off by {worst}");
+    }
+
+    #[test]
+    fn direct_color32_output_matches_rgb_output() {
+        let p = Picture::default().merged(&json!({
+            "brightness": -0.25, "shadows": 0.05, "highlights": 0.55,
+            "contrast": -0.02, "saturation": 0.92, "shadow_tint": 0.05
+        }));
+        let lut = Lut::new(&p);
+        let src: Vec<u8> = (0..=255u8).flat_map(|v| [v, 255 - v, v / 2]).collect();
+        let mut rgb = Vec::new();
+        lut.apply(&src, &mut rgb);
+        let rgba = lut.apply_color32(&src);
+        let flattened: Vec<u8> = rgba.into_iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
+        assert_eq!(flattened, rgb);
     }
 
     #[test]

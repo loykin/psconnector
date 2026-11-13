@@ -472,7 +472,6 @@ impl eframe::App for App {
                                 runner,
                                 fps: FpsMeter::default(),
                                 lut: None,
-                                adjusted: Vec::new(),
                                 picture_open: false,
                                 preset_name: String::new(),
                                 upload: (0, Duration::ZERO, None),
@@ -1210,9 +1209,8 @@ struct Viewer {
     shown: Option<Arc<Frame>>,
     runner: Arc<Mutex<Runner>>,
     fps: FpsMeter,
-    /// Picture adjustment: tables for the version in use, the adjusted frame, and the settings window
+    /// Picture adjustment: tables for the version in use and the settings window
     lut: Option<(u64, picture::Lut)>,
-    adjusted: Vec<u8>,
     picture_open: bool,
     preset_name: String,
     /// Time spent turning frames into the window texture, logged every 10 s
@@ -1580,8 +1578,7 @@ impl Viewer {
                 egui::ColorImage::from_rgb([f.width, f.height], &f.rgb)
             } else {
                 let (_, lut) = self.lut.as_ref().expect("lut");
-                lut.apply(&f.rgb, &mut self.adjusted);
-                egui::ColorImage::from_rgb([f.width, f.height], &self.adjusted)
+                egui::ColorImage::new([f.width, f.height], lut.apply_color32(&f.rgb))
             };
             match &mut self.texture {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
