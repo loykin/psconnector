@@ -107,7 +107,9 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name optional) | `ok started` / `ok scheduled for …` |
 | `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
 | `{"input_bench":{}}` / `{"input_bench":{"seconds":12,"interval_ms":10,"burst":4}}` generate below-dead-zone input for latency statistics | `ok input benchmark started ...` |
-| `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"Like a Dragon: Hawaii"}` picture adjustment (`""` only reports) | `ok {values}` |
+| `{"picture_snap":"/tmp/shown.png"}` save the current frame with the window's picture adjustment applied | `ok` |
+| `{"video_range":"auto|limited|full"}` override incorrect H.264 range metadata (`""` only reports) | `ok full` |
+| `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"saved preset name"}` picture adjustment (`""` only reports) | `ok {values}` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
 
 A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.

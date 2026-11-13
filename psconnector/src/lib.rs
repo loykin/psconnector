@@ -45,6 +45,7 @@ pub use controller::Button;
 use std::sync::Arc;
 pub use stream::{Phase, StreamConfig};
 pub use video::Frame;
+pub use video::VideoRange;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -57,11 +58,20 @@ pub struct Options {
     pub video: bool,
     /// Whether to decode audio. Take the decoded chunks with [`Client::take_audio`].
     pub audio: bool,
+    /// YUV sample range. Auto follows H.264 metadata; overrides help streams with incorrect VUI flags.
+    pub video_range: VideoRange,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { profile: None, user: None, stream: StreamConfig::default(), video: true, audio: false }
+        Self {
+            profile: None,
+            user: None,
+            stream: StreamConfig::default(),
+            video: true,
+            audio: false,
+            video_range: VideoRange::Auto,
+        }
     }
 }
 
@@ -75,6 +85,7 @@ pub struct Client {
     audio: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Audio>>>,
     stream_task: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     ctrl_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    video_range: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Client {
@@ -94,10 +105,11 @@ impl Client {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (phase_tx, mut phase_rx) = watch::channel(Phase::Connecting);
         let (frame_tx, frame_rx) = watch::channel(None);
+        let video_range = Arc::new(std::sync::atomic::AtomicU8::new(opts.video_range.atomic()));
         let (video_tx, cfg) = if opts.video {
             let (tx, rx) = std::sync::mpsc::channel();
             let need_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            video::spawn_decoder(rx, frame_tx, need_key.clone());
+            video::spawn_decoder(rx, frame_tx, need_key.clone(), video_range.clone());
             (Some((tx, need_key)), opts.stream)
         } else {
             (None, StreamConfig::minimal())
@@ -139,6 +151,7 @@ impl Client {
             audio: std::sync::Mutex::new(audio_rx),
             stream_task: std::sync::Mutex::new(Some(stream_task)),
             ctrl_task: std::sync::Mutex::new(Some(started.ctrl_task)),
+            video_range,
         })
     }
 
@@ -164,6 +177,11 @@ impl Client {
     /// Returns another frame receiver (for receiving frames on other threads or tasks).
     pub fn frames(&self) -> watch::Receiver<Option<Arc<Frame>>> {
         self.frame.clone()
+    }
+
+    /// Changes sample-range interpretation for subsequent frames without reconnecting.
+    pub fn set_video_range(&self, range: VideoRange) {
+        self.video_range.store(range.atomic(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Decoded audio, in 10 ms chunks (only with `Options::audio`). Can be taken once.

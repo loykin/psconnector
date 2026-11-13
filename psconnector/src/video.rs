@@ -45,6 +45,34 @@ struct ColorSpec {
     matrix_code: u8,
 }
 
+/// How decoded YUV sample levels are mapped to RGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoRange {
+    /// Follow the H.264 VUI flag.
+    #[default]
+    Auto,
+    Limited,
+    Full,
+}
+
+impl VideoRange {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            1 => Self::Limited,
+            2 => Self::Full,
+            _ => Self::Auto,
+        }
+    }
+
+    pub(crate) fn atomic(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::Limited => 1,
+            Self::Full => 2,
+        }
+    }
+}
+
 impl Default for ColorSpec {
     fn default() -> Self {
         Self { full_range: false, matrix: Matrix::Bt709, primaries: 1, transfer: 1, matrix_code: 1 }
@@ -472,6 +500,7 @@ pub fn spawn_decoder(
     rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
     out: watch::Sender<Option<Arc<Frame>>>,
     need_key: Arc<std::sync::atomic::AtomicBool>,
+    range: Arc<std::sync::atomic::AtomicU8>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("psconnector-video".into())
@@ -552,7 +581,13 @@ pub fn spawn_decoder(
                             rgb = frame.rgb;
                         }
                         rgb.resize(w * h * 3, 0);
-                        write_rgb8(&yuv, color.unwrap_or_default(), &mut rgb);
+                        let mut spec = color.unwrap_or_default();
+                        match VideoRange::from_atomic(range.load(std::sync::atomic::Ordering::Relaxed)) {
+                            VideoRange::Auto => {}
+                            VideoRange::Limited => spec.full_range = false,
+                            VideoRange::Full => spec.full_range = true,
+                        }
+                        write_rgb8(&yuv, spec, &mut rgb);
                         let frame = Arc::new(Frame { width: w, height: h, rgb: std::mem::take(&mut rgb), index });
                         if let Some(old) = out.send_replace(Some(frame)) {
                             reusable.push(old);

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use eframe::egui;
-use psconnector::{Audio, Button, Client, Frame, Options};
+use psconnector::{Audio, Button, Client, Frame, Options, VideoRange};
 use quality::Quality;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -68,6 +68,7 @@ struct Shared {
     client: std::sync::RwLock<Arc<Client>>,
     host: String,
     quality: Mutex<Quality>,
+    video_range: Mutex<VideoRange>,
     bitrate_kbps: Option<u32>,
     use_audio: bool,
     /// Where each connection's audio is forwarded to (None when sound is off)
@@ -107,6 +108,12 @@ impl Shared {
         }
     }
 
+    fn set_video_range(&self, range: VideoRange) {
+        *self.video_range.lock().unwrap() = range;
+        self.client().set_video_range(range);
+        settings::set("video_range", Value::String(video_range_name(range).into()));
+    }
+
     fn client(&self) -> Arc<Client> {
         self.client.read().unwrap().clone()
     }
@@ -121,7 +128,12 @@ impl Shared {
     }
 
     fn options(&self, q: Quality) -> Options {
-        Options { audio: self.use_audio, stream: q.stream(self.bitrate_kbps), ..Options::default() }
+        Options {
+            audio: self.use_audio,
+            stream: q.stream(self.bitrate_kbps),
+            video_range: *self.video_range.lock().unwrap(),
+            ..Options::default()
+        }
     }
 
     /// Sends this connection's decoded audio on to the sound output.
@@ -248,6 +260,8 @@ fn main() -> Result<()> {
         macro_sources = default_macro_sources();
     }
     let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
+    let video_range =
+        settings::get("video_range").and_then(|v| v.as_str().and_then(parse_video_range)).unwrap_or(VideoRange::Auto);
     // turned off when signing out of an account that came from pyremoteplay
     psconnector::profile::set_read_pyremoteplay(
         settings::get("read_pyremoteplay").and_then(|v| v.as_bool()) != Some(false),
@@ -263,6 +277,7 @@ fn main() -> Result<()> {
         start_muted,
         quality,
         bitrate_kbps,
+        video_range,
     };
     let rt = tokio::runtime::Runtime::new()?;
     rt.spawn(async {
@@ -328,11 +343,34 @@ struct Launch {
     start_muted: bool,
     quality: Quality,
     bitrate_kbps: Option<u32>,
+    video_range: VideoRange,
 }
 
 impl Launch {
     fn options(&self, q: Quality) -> Options {
-        Options { audio: self.use_audio, stream: q.stream(self.bitrate_kbps), ..Options::default() }
+        Options {
+            audio: self.use_audio,
+            stream: q.stream(self.bitrate_kbps),
+            video_range: self.video_range,
+            ..Options::default()
+        }
+    }
+}
+
+fn video_range_name(range: VideoRange) -> &'static str {
+    match range {
+        VideoRange::Auto => "auto",
+        VideoRange::Limited => "limited",
+        VideoRange::Full => "full",
+    }
+}
+
+fn parse_video_range(name: &str) -> Option<VideoRange> {
+    match name.to_ascii_lowercase().as_str() {
+        "auto" => Some(VideoRange::Auto),
+        "limited" => Some(VideoRange::Limited),
+        "full" => Some(VideoRange::Full),
+        _ => None,
     }
 }
 
@@ -419,6 +457,7 @@ fn start_session(
         client: std::sync::RwLock::new(client.clone()),
         host,
         quality: Mutex::new(l.quality),
+        video_range: Mutex::new(l.video_range),
         bitrate_kbps: l.bitrate_kbps,
         use_audio: l.use_audio,
         audio_out: out.audio.clone(),
@@ -1320,10 +1359,19 @@ impl Viewer {
 
 impl Viewer {
     /// Saved presets (name → values) from the settings file.
-    fn saved_presets() -> Vec<(String, picture::Picture)> {
+    fn saved_presets() -> Vec<(String, picture::Picture, Option<VideoRange>)> {
         settings::get("picture_presets")
             .and_then(|v| v.as_object().cloned())
-            .map(|o| o.iter().map(|(k, v)| (k.clone(), picture::Picture::default().merged(v))).collect())
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| {
+                        // Old presets stored picture fields directly. New presets also carry source range.
+                        let values = v.get("picture").unwrap_or(v);
+                        let range = v.get("video_range").and_then(Value::as_str).and_then(parse_video_range);
+                        (k.clone(), picture::Picture::default().merged(values), range)
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1333,14 +1381,40 @@ impl Viewer {
         let before = p;
         egui::Window::new("Picture").open(&mut open).resizable(false).default_width(300.0).show(ctx, |ui| {
             ui.label(theme::muted(ui, "Changes only what you see here; macros and screenshots get the original."));
-            let presets: Vec<(String, picture::Picture)> =
-                picture::builtin().into_iter().map(|(n, v)| (n.to_string(), v)).chain(Self::saved_presets()).collect();
-            let current =
-                presets.iter().find(|(_, v)| *v == p).map(|(n, _)| n.clone()).unwrap_or_else(|| "Custom".into());
+            let current_range = *self.shared.video_range.lock().unwrap();
+            let mut chosen_range = current_range;
+            ui.horizontal(|ui| {
+                ui.label("Source range");
+                egui::ComboBox::from_id_salt("video_range").selected_text(video_range_name(current_range)).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut chosen_range, VideoRange::Auto, "auto");
+                        ui.selectable_value(&mut chosen_range, VideoRange::Limited, "limited");
+                        ui.selectable_value(&mut chosen_range, VideoRange::Full, "full");
+                    },
+                );
+            });
+            if chosen_range != current_range {
+                self.shared.set_video_range(chosen_range);
+            }
+            let presets: Vec<(String, picture::Picture, Option<VideoRange>)> = picture::builtin()
+                .into_iter()
+                .map(|(n, v)| (n.to_string(), v, Some(VideoRange::Auto)))
+                .chain(Self::saved_presets())
+                .collect();
+            let current = presets
+                .iter()
+                .find(|(_, v, range)| *v == p && range.is_none_or(|r| r == current_range))
+                .map(|(n, _, _)| n.clone())
+                .unwrap_or_else(|| "Custom".into());
             egui::ComboBox::from_id_salt("picture_preset").selected_text(current).width(220.0).show_ui(ui, |ui| {
-                for (name, v) in &presets {
-                    if ui.selectable_label(*v == p, name).clicked() {
+                for (name, v, range) in &presets {
+                    let selected = *v == p && range.is_none_or(|r| r == current_range);
+                    if ui.selectable_label(selected, name).clicked() {
                         p = *v;
+                        if let Some(range) = range {
+                            self.shared.set_video_range(*range);
+                        }
                     }
                 }
             });
@@ -1368,15 +1442,19 @@ impl Viewer {
                 ui.end_row();
             });
             ui.horizontal(|ui| {
-                if ui.button("Reset").clicked() {
+                if ui.button("Reset all").clicked() {
                     p = picture::Picture::default();
+                    self.shared.set_video_range(VideoRange::Auto);
                 }
                 ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(120.0).hint_text("preset name"));
                 if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
                     let mut all = settings::get("picture_presets")
                         .filter(Value::is_object)
                         .unwrap_or_else(|| serde_json::json!({}));
-                    all[self.preset_name.trim()] = p.to_json();
+                    all[self.preset_name.trim()] = serde_json::json!({
+                        "picture": p.to_json(),
+                        "video_range": video_range_name(*self.shared.video_range.lock().unwrap()),
+                    });
                     settings::set("picture_presets", all);
                     self.preset_name.clear();
                 }
@@ -1570,6 +1648,19 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
         let path = path.to_string();
         tokio::task::spawn_blocking(move || save_png(&path, &f)).await??;
+    } else if let Some(path) = m["picture_snap"].as_str() {
+        // Unlike `snap`, this captures the actual display adjustment. It is primarily for comparing and
+        // tuning presets without pretending that the unadjusted macro/OCR frame is what the window shows.
+        let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
+        let adjustment = *sh.picture.lock().unwrap();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut rgb = Vec::new();
+            picture::Lut::new(&adjustment).apply(&f.rgb, &mut rgb);
+            let adjusted = Frame { width: f.width, height: f.height, rgb, index: f.index };
+            save_png(&path, &adjusted)
+        })
+        .await??;
     } else if let Some(path) = m["play"].as_str() {
         if sh.playing.swap(true, Ordering::SeqCst) {
             bail!("already playing");
@@ -1638,22 +1729,35 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
                 "height": f.as_ref().map(|f| f.height),
             })
         )));
+    } else if let Some(name) = m["video_range"].as_str() {
+        if !name.is_empty() {
+            let range = parse_video_range(name).ok_or_else(|| anyhow!("video_range must be auto, limited or full"))?;
+            sh.set_video_range(range);
+        }
+        return Ok(Reply::Text(format!("ok {}", video_range_name(*sh.video_range.lock().unwrap()))));
     } else if let Some(v) = m.get("picture") {
         // {"picture": {"shadows": 0.5, ...}} changes those values; {"picture": "preset name"} loads a preset;
         // {"picture": ""} only reports. Reply: ok {current values}
         let cur = *sh.picture.lock().unwrap();
         let next = match v {
-            Value::Object(_) => Some(cur.merged(v)),
-            Value::String(name) if !name.is_empty() => Some(
-                picture::builtin()
+            Value::Object(_) => Some((cur.merged(v), None)),
+            Value::String(name) if !name.is_empty() => {
+                let builtin = picture::builtin()
                     .into_iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                    .map(|(_, p)| p)
-                    .ok_or_else(|| anyhow!("no picture preset named '{name}'"))?,
-            ),
+                    .map(|(_, p)| (p, Some(VideoRange::Auto)));
+                let saved = Viewer::saved_presets()
+                    .into_iter()
+                    .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, p, range)| (p, range));
+                Some(builtin.or(saved).ok_or_else(|| anyhow!("no picture preset named '{name}'"))?)
+            }
             _ => None,
         };
-        if let Some(p) = next {
+        if let Some((p, range)) = next {
+            if let Some(range) = range {
+                sh.set_video_range(range);
+            }
             sh.set_picture(p);
         }
         return Ok(Reply::Text(format!("ok {}", sh.picture.lock().unwrap().to_json())));

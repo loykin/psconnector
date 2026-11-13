@@ -33,14 +33,7 @@ impl Default for Picture {
 
 /// Built-in presets: (name, values)
 pub fn builtin() -> Vec<(&'static str, Picture)> {
-    vec![
-        ("Original", Picture::default()),
-        (
-            "Like a Dragon: Hawaii",
-            // tuned on Honolulu streets in daylight: lift the crushed shade, take out its blue cast
-            Picture { shadows: 0.6, highlights: 0.8, contrast: -0.05, saturation: 0.85, warmth: 0.3, shadow_tint: 0.7 },
-        ),
-    ]
+    vec![("Original", Picture::default())]
 }
 
 impl Picture {
@@ -177,8 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn hawaii_lifts_shadows_keeps_black_neutral_and_curve_rising() {
-        let p = builtin()[1].1;
+    fn adjustment_lifts_shadows_keeps_black_neutral_and_curve_rising() {
+        let p =
+            Picture { shadows: 0.6, highlights: 0.8, contrast: -0.05, saturation: 0.85, warmth: 0.3, shadow_tint: 0.7 };
         let lut = Lut::new(&p);
         let mut out = Vec::new();
         // a near-black, slightly blue pixel: lifted, but not turned purple
