@@ -170,6 +170,13 @@ impl Lut {
             })
             .collect()
     }
+
+    /// Integer lookup table consumed by the GPU picture shader. Keeping the exact
+    /// CPU table makes switching renderers preserve every saved preset.
+    pub(crate) fn gpu_table(&self) -> ([[i32; 4]; 256], [i32; 2]) {
+        let table = std::array::from_fn(|i| [self.gain[i], self.offset[i], self.target[i], self.chroma[i]]);
+        (table, [self.red, self.blue])
+    }
 }
 
 #[cfg(test)]

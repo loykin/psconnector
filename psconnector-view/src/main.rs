@@ -17,7 +17,8 @@
 //!   At the limit, a macro that polls `should_stop` gets 2 minutes to finish; others are stopped right away.
 //!
 //! Commands: `{"button":"cross","action":"tap|press|release","hold":0.08}` `{"stick":"left","x":0,"y":-1}`
-//! `{"release_all":true}` `{"snap":"path.png"}` `{"frame":true}` `{"play":"recording.json"}` `{"stop":true}`
+//! `{"release_all":true}` `{"snap":"path.png"}` `{"screen_snap":"path.png"}` `{"frame":true}`
+//! `{"play":"recording.json"}` `{"stop":true}`
 //! `{"status":true}` `{"osd":"text"}` `{"standby":true}` `{"ocr":[x,y,w,h],"scale":2}` (reply `ok ["line", ...]`)
 //! Macros: `{"macros":true}` `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name
 //! optional) `{"macro_stop":true}` (also cancels a schedule) `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
@@ -43,6 +44,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+mod gpu_video;
 mod login_window;
 mod ocr;
 mod pad;
@@ -341,6 +343,7 @@ fn main() -> Result<()> {
                 launch,
                 outputs,
                 session: app_session,
+                gpu_video: cc.wgpu_render_state.as_ref().map(gpu_video::GpuVideo::new),
                 state: State::Setup(Box::new(setup)),
             }))
         }),
@@ -439,6 +442,7 @@ struct App {
     outputs: Outputs,
     /// The running session, also closed by main() after the window is gone
     session: Arc<Mutex<Option<Arc<Shared>>>>,
+    gpu_video: Option<gpu_video::GpuVideo>,
     state: State,
 }
 
@@ -467,6 +471,7 @@ impl eframe::App for App {
                             *self.session.lock().unwrap() = Some(shared.clone());
                             self.state = State::Viewer(Box::new(Viewer {
                                 shared,
+                                gpu_video: self.gpu_video.clone(),
                                 texture: None,
                                 shown: None,
                                 runner,
@@ -1205,6 +1210,8 @@ fn interrupt(child: &mut Child) {
 
 struct Viewer {
     shared: Arc<Shared>,
+    /// WGPU shader path; the texture is retained as a fallback for non-WGPU backends.
+    gpu_video: Option<gpu_video::GpuVideo>,
     texture: Option<egui::TextureHandle>,
     shown: Option<Arc<Frame>>,
     runner: Arc<Mutex<Runner>>,
@@ -1574,15 +1581,20 @@ impl Viewer {
         {
             let new_frame = !self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f));
             let t0 = Instant::now();
-            let img = if neutral {
-                egui::ColorImage::from_rgb([f.width, f.height], &f.rgb)
-            } else {
+            if let Some(gpu) = &self.gpu_video {
                 let (_, lut) = self.lut.as_ref().expect("lut");
-                egui::ColorImage::new([f.width, f.height], lut.apply_color32(&f.rgb))
-            };
-            match &mut self.texture {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture("ps5", img, egui::TextureOptions::LINEAR)),
+                gpu.submit(f.clone(), lut, version);
+            } else {
+                let img = if neutral {
+                    egui::ColorImage::from_rgb([f.width, f.height], &f.rgb)
+                } else {
+                    let (_, lut) = self.lut.as_ref().expect("lut");
+                    egui::ColorImage::new([f.width, f.height], lut.apply_color32(&f.rgb))
+                };
+                match &mut self.texture {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.texture = Some(ctx.load_texture("ps5", img, egui::TextureOptions::LINEAR)),
+                }
             }
             self.shown = Some(f);
             if new_frame {
@@ -1593,11 +1605,21 @@ impl Viewer {
             *total += t0.elapsed();
             let since = *since.get_or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_secs(10) {
-                log::info!(
-                    "window: {} frames shown in 10 s, {:.1} ms each to adjust and upload",
-                    *n,
-                    total.as_secs_f64() * 1000.0 / f64::from((*n).max(1))
-                );
+                if let Some(gpu) = &self.gpu_video {
+                    let (prepared, ms) = gpu.take_prepare_stats();
+                    log::info!(
+                        "window: {} frames shown in 10 s, {} GPU uploads ({:.2} ms CPU each; picture adjustment on GPU)",
+                        *n,
+                        prepared,
+                        ms,
+                    );
+                } else {
+                    log::info!(
+                        "window: {} frames shown in 10 s, {:.1} ms each to adjust and upload",
+                        *n,
+                        total.as_secs_f64() * 1000.0 / f64::from((*n).max(1))
+                    );
+                }
                 self.upload = (0, Duration::ZERO, Some(Instant::now()));
             }
         }
@@ -1614,7 +1636,11 @@ impl Viewer {
             egui::vec2(area.width(), area.width() * 9.0 / 16.0)
         };
         let rect = egui::Rect::from_center_size(area.center(), size);
-        if let Some(t) = &self.texture {
+        if let Some(gpu) = &self.gpu_video
+            && self.shown.is_some()
+        {
+            painter.add(gpu.paint_callback(rect));
+        } else if let Some(t) = &self.texture {
             painter.image(
                 t.id(),
                 rect,
@@ -1732,6 +1758,20 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
         let path = path.to_string();
         tokio::task::spawn_blocking(move || save_png(&path, &f)).await??;
+    } else if let Some(path) = m["screen_snap"].as_str() {
+        // Captures the composed viewport, including the GPU picture shader. `snap` and
+        // `picture_snap` intentionally remain decoder-sized images for macro tooling.
+        let ctx = sh.ctx.get().ok_or_else(|| anyhow!("window is not ready"))?.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.request_screenshot(move |image| {
+            let _ = tx.send(image);
+        });
+        let image = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .context("window screenshot timed out")?
+            .context("window screenshot was cancelled")?;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || save_color_image(&path, &image)).await??;
     } else if let Some(path) = m["picture_snap"].as_str() {
         // Unlike `snap`, this captures the actual display adjustment. It is primarily for comparing and
         // tuning presets without pretending that the unadjusted macro/OCR frame is what the window shows.
@@ -1948,6 +1988,16 @@ fn save_png(path: &str, f: &Frame) -> Result<()> {
     enc.set_color(png::ColorType::Rgb);
     enc.set_compression(png::Compression::Fast);
     enc.write_header()?.write_image_data(&f.rgb)?;
+    Ok(())
+}
+
+fn save_color_image(path: &str, image: &egui::ColorImage) -> Result<()> {
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = png::Encoder::new(file, image.width() as u32, image.height() as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_compression(png::Compression::Fast);
+    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+    enc.write_header()?.write_image_data(&rgba)?;
     Ok(())
 }
 
