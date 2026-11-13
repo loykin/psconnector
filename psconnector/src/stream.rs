@@ -196,7 +196,7 @@ fn launch_spec(cfg: &StreamConfig, handshake_key: &[u8; 16]) -> String {
             r#""network":{{"bwKbpsSent":{},"bwLoss":0.001000,"mtu":1454,"rtt":1,"ports":[53,2053]}},"slotId":1,"#,
             r#""appSpecification":{{"minFps":30,"minBandwidth":0,"extTitleId":"ps3","version":1,"timeLimit":1,"startTimeout":100,"afkTimeout":100,"afkTimeoutDisconnect":100}},"#,
             r#""konan":{{"ps3AccessToken":"accessToken","ps3RefreshToken":"refreshToken"}},"#,
-            r#""requestGameSpecification":{{"model":"bravia_tv","platform":"android","audioChannels":"5.1","language":"sp","acceptButton":"X","connectedControllers":["xinput","ds3","ds4"],"yuvCoefficient":"bt601","videoEncoderProfile":"hw4.1","audioEncoderProfile":"audio1","adaptiveStreamMode":"resize"}},"#,
+            r#""requestGameSpecification":{{"model":"bravia_tv","platform":"android","audioChannels":"5.1","language":"sp","acceptButton":"X","connectedControllers":["xinput","ds3","ds4"],"yuvCoefficient":"bt709","videoEncoderProfile":"hw4.1","audioEncoderProfile":"audio1","adaptiveStreamMode":"resize"}},"#,
             r#""userProfile":{{"onlineId":"psnId","npId":"npId","region":"US","languagesUsed":["en","jp"]}},"#,
             r#""videoCodec":"avc","dynamicRange":"SDR","handshakeKey":"{}"}}"#,
         ),
@@ -316,6 +316,10 @@ impl Stream {
                     } else {
                         info!("got {}-byte video header", header.len());
                     }
+                    debug!(
+                        "video header: {}",
+                        header.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join("")
+                    );
                     v.assembler = Some(Assembler::new(header));
                 }
                 self.send_data(&proto::simple(PayloadType::StreamInfoAck), 9, true).await;

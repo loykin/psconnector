@@ -4652,6 +4652,7 @@ dependencies = [
  "png",
  "prost",
  "rand",
+ "rayon",
  "serde_json",
  "sha2",
  "socket2",
