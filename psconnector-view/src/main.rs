@@ -1589,6 +1589,21 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         }
     } else if m.get("stop").is_some() {
         sh.stop_play.store(true, Ordering::SeqCst);
+    } else if let Some(options) = m.get("input_bench") {
+        // Generates a small, repeatable command load so input queue latency can be measured without a person
+        // moving the pad. Stick values default below the console dead zone and button events are releases only.
+        if sh.playing.swap(true, Ordering::SeqCst) {
+            bail!("already playing or benchmarking");
+        }
+        sh.stop_play.store(false, Ordering::SeqCst);
+        let seconds = options["seconds"].as_f64().unwrap_or(12.0).clamp(2.0, 30.0);
+        let interval = options["interval_ms"].as_u64().unwrap_or(10).clamp(1, 100);
+        let burst = options["burst"].as_u64().unwrap_or(4).clamp(1, 20) as usize;
+        let amplitude = options["amplitude"].as_f64().unwrap_or(0.01).clamp(0.0, 1.0) as f32;
+        tokio::spawn(input_bench(sh.clone(), seconds, interval, burst, amplitude));
+        return Ok(Reply::Text(format!(
+            "ok input benchmark started ({seconds:.1} s, {interval} ms interval, burst {burst})"
+        )));
     } else if m.get("status").is_some() {
         return Ok(Reply::Text(if sh.playing.load(Ordering::SeqCst) { "ok playing" } else { "ok idle" }.into()));
     } else if let Some(text) = m.get("osd") {
@@ -1686,6 +1701,29 @@ async fn play(events: Vec<Value>, sh: Arc<Shared>) {
     c.stick(false, 0.0, 0.0);
     c.stick(true, 0.0, 0.0);
     sh.playing.store(false, Ordering::SeqCst);
+}
+
+/// Generates repeatable, normally invisible input traffic for the passive latency counters in the stream.
+async fn input_bench(sh: Arc<Shared>, seconds: f64, interval_ms: u64, burst: usize, amplitude: f32) {
+    let c = sh.client();
+    let interval = Duration::from_millis(interval_ms);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(seconds);
+    let mut tick = 0u64;
+    while tokio::time::Instant::now() < deadline && !sh.stop_play.load(Ordering::SeqCst) {
+        for n in 0..burst {
+            let direction = if (tick + n as u64).is_multiple_of(2) { 1.0 } else { -1.0 };
+            c.stick(true, amplitude * direction, 0.0);
+        }
+        // A release of an already-up button exercises the ordered button path without triggering gameplay.
+        if tick.is_multiple_of(10) {
+            c.release(Button::Cross);
+        }
+        tick += 1;
+        tokio::time::sleep(interval).await;
+    }
+    sh.release_all();
+    sh.playing.store(false, Ordering::SeqCst);
+    log::info!("input benchmark finished after {tick} ticks; all controls released");
 }
 
 fn png_bytes(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>> {

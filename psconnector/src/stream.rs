@@ -87,9 +87,99 @@ struct VideoState {
 
 #[derive(Debug)]
 pub enum Cmd {
-    Button(Button, bool),
-    Stick { right: bool, x: f32, y: f32 },
+    Button { button: Button, pressed: bool, queued_at: std::time::Instant },
+    Stick { right: bool, x: f32, y: f32, queued_at: std::time::Instant },
     Stop,
+}
+
+#[derive(Default)]
+struct Latencies(Vec<u64>);
+
+impl Latencies {
+    fn record(&mut self, elapsed: Duration) {
+        self.0.push(elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn summary(&mut self) -> Option<String> {
+        if self.0.is_empty() {
+            return None;
+        }
+        self.0.sort_unstable();
+        let at = |percent: usize| {
+            let index = (self.0.len() * percent).div_ceil(100).saturating_sub(1);
+            self.0[index] as f64 / 1000.0
+        };
+        let summary =
+            format!("n={} p50={:.2} p95={:.2} p99={:.2} max={:.2} ms", self.0.len(), at(50), at(95), at(99), at(100));
+        self.0.clear();
+        Some(summary)
+    }
+}
+
+struct InputStats {
+    since: std::time::Instant,
+    button_queue: Latencies,
+    button_total: Latencies,
+    stick_queue: Latencies,
+    stick_total: Latencies,
+    stick_events: u32,
+    stick_packets: u32,
+}
+
+impl Default for InputStats {
+    fn default() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            button_queue: Latencies::default(),
+            button_total: Latencies::default(),
+            stick_queue: Latencies::default(),
+            stick_total: Latencies::default(),
+            stick_events: 0,
+            stick_packets: 0,
+        }
+    }
+}
+
+impl InputStats {
+    fn button(&mut self, queued_at: std::time::Instant, dequeued_at: std::time::Instant) {
+        self.button_queue.record(dequeued_at.saturating_duration_since(queued_at));
+        self.button_total.record(queued_at.elapsed());
+    }
+
+    fn stick_event(&mut self, queued_at: std::time::Instant) {
+        self.stick_events += 1;
+        self.stick_queue.record(queued_at.elapsed());
+    }
+
+    fn stick_packet(&mut self, latest_at: std::time::Instant) {
+        self.stick_packets += 1;
+        self.stick_total.record(latest_at.elapsed());
+    }
+
+    fn report(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(10) {
+            return;
+        }
+        let button_queue = self.button_queue.summary();
+        let button_total = self.button_total.summary();
+        let stick_queue = self.stick_queue.summary();
+        let stick_total = self.stick_total.summary();
+        if let (Some(queue), Some(total)) = (button_queue, button_total) {
+            info!("input buttons over {:.0} s: queue [{queue}], API-to-UDP [{total}]", elapsed.as_secs_f64());
+        }
+        if let (Some(queue), Some(total)) = (stick_queue, stick_total) {
+            info!(
+                "input sticks over {:.0} s: {} events → {} packets, queue [{queue}], latest-to-UDP [{total}]",
+                elapsed.as_secs_f64(),
+                self.stick_events,
+                self.stick_packets
+            );
+        }
+        self.stick_events = 0;
+        self.stick_packets = 0;
+        self.since = std::time::Instant::now();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -358,6 +448,7 @@ pub async fn run(
     // A non-stick command found while coalescing stick motion. Keeping it here preserves the FIFO boundary
     // between state changes and ordered button events.
     let mut pending_cmd = None;
+    let mut input_stats = InputStats::default();
 
     loop {
         let resend_at = resend.as_ref().map(|r| r.0).unwrap_or(far);
@@ -437,21 +528,28 @@ pub async fn run(
                     None => cmd.recv().await,
                 }
             } => match c {
-                Some(Cmd::Button(b, pressed)) => {
-                    if let Some(pkt) = s.send_event(b, pressed).await {
+                Some(Cmd::Button { button, pressed, queued_at }) => {
+                    let dequeued_at = std::time::Instant::now();
+                    if let Some(pkt) = s.send_event(button, pressed).await {
                         resend = Some((Instant::now() + EVENT_RESEND, pkt));
                     } else {
-                        warn!("stream not ready, ignoring button {}", b.name());
+                        warn!("stream not ready, ignoring button {}", button.name());
                     }
+                    input_stats.button(queued_at, dequeued_at);
+                    input_stats.report();
                 }
-                Some(Cmd::Stick { right, x, y }) => {
+                Some(Cmd::Stick { right, x, y, queued_at }) => {
                     if right { s.sticks.right = (x, y) } else { s.sticks.left = (x, y) }
+                    input_stats.stick_event(queued_at);
+                    let mut latest_at = queued_at;
                     // Axis events can arrive much faster than the network task under video load. Merge only
                     // consecutive stick commands; stop at a button/Stop so their relative order is retained.
                     loop {
                         match cmd.try_recv() {
-                            Ok(Cmd::Stick { right, x, y }) => {
+                            Ok(Cmd::Stick { right, x, y, queued_at }) => {
                                 if right { s.sticks.right = (x, y) } else { s.sticks.left = (x, y) }
+                                input_stats.stick_event(queued_at);
+                                latest_at = queued_at;
                             }
                             Ok(other) => {
                                 pending_cmd = Some(other);
@@ -465,6 +563,8 @@ pub async fn run(
                         }
                     }
                     s.send_state().await;
+                    input_stats.stick_packet(latest_at);
+                    input_stats.report();
                 }
                 Some(Cmd::Stop) | None => {
                     if s.cipher.is_some() {
@@ -493,5 +593,25 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_summary_reports_percentiles_and_clears_samples() {
+        let mut values = Latencies::default();
+        for ms in 1..=100 {
+            values.record(Duration::from_millis(ms));
+        }
+        let summary = values.summary().unwrap();
+        assert!(summary.contains("n=100"), "{summary}");
+        assert!(summary.contains("p50=50.00"), "{summary}");
+        assert!(summary.contains("p95=95.00"), "{summary}");
+        assert!(summary.contains("p99=99.00"), "{summary}");
+        assert!(summary.contains("max=100.00"), "{summary}");
+        assert!(values.summary().is_none());
     }
 }

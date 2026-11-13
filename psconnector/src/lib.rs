@@ -35,7 +35,7 @@ mod video;
 mod crypto_tests;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use error::{Error, Result};
 use tokio::sync::{mpsc, watch};
@@ -172,11 +172,11 @@ impl Client {
     }
 
     pub fn press(&self, b: Button) {
-        let _ = self.cmd.send(stream::Cmd::Button(b, true));
+        let _ = self.cmd.send(stream::Cmd::Button { button: b, pressed: true, queued_at: Instant::now() });
     }
 
     pub fn release(&self, b: Button) {
-        let _ = self.cmd.send(stream::Cmd::Button(b, false));
+        let _ = self.cmd.send(stream::Cmd::Button { button: b, pressed: false, queued_at: Instant::now() });
     }
 
     /// Presses, waits `hold`, then releases.
@@ -188,7 +188,7 @@ impl Client {
 
     /// Stick: x and y are -1.0 to 1.0 (up is negative).
     pub fn stick(&self, right: bool, x: f32, y: f32) {
-        let _ = self.cmd.send(stream::Cmd::Stick { right, x, y });
+        let _ = self.cmd.send(stream::Cmd::Stick { right, x, y, queued_at: Instant::now() });
     }
 
     /// Puts the console into rest mode (this also ends the session).

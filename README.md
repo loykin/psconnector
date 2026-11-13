@@ -106,6 +106,7 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"macros":true}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
 | `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name optional) | `ok started` / `ok scheduled for …` |
 | `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
+| `{"input_bench":{}}` / `{"input_bench":{"seconds":12,"interval_ms":10,"burst":4}}` generate below-dead-zone input for latency statistics | `ok input benchmark started ...` |
 | `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"Like a Dragon: Hawaii"}` picture adjustment (`""` only reports) | `ok {values}` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
 
