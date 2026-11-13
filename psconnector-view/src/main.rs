@@ -1203,7 +1203,7 @@ impl Viewer {
         let runner = self.runner.clone();
         let mut r = runner.lock().unwrap();
         let r = &mut *r;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if theme::ghost(ui, true, "🎨 Picture")
                 .on_hover_text("Brightness, contrast, colour range and saved game presets")
                 .clicked()
