@@ -1,8 +1,10 @@
 //! Plays the console's audio on this computer's default output device.
 //!
 //! A feeder thread converts the decoded chunks to the device format and fills a small buffer; the device
-//! callback drains it. The buffer is kept short (about 40–120 ms) so sound stays in step with the picture:
-//! when it runs dry the device plays silence, and when it grows too long the oldest audio is dropped.
+//! callback drains it. Audio arrives in bursts (it shares the network with large video frames), so the
+//! buffer aims at about 120 ms: when it holds more, playback runs 2 % faster until it is back; when it holds
+//! less, 2 % slower. Only if it runs dry does the device play silence, and only far beyond the target is
+//! old audio dropped.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,14 +16,31 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 use psconnector::Audio;
 
 /// Start playing once this much is buffered (and again after running dry)
-const START_MS: usize = 40;
-/// Drop the oldest audio beyond this much buffered
-const MAX_MS: usize = 120;
+const START_MS: usize = 80;
+/// Buffer size to steer towards
+const TARGET_MS: usize = 120;
+/// Above this, play slightly faster; below LOW_MS, slightly slower
+const HIGH_MS: usize = 180;
+const LOW_MS: usize = 60;
+/// Drop the oldest audio beyond this much buffered (down to TARGET_MS)
+const MAX_MS: usize = 350;
+/// If decoded PCM has backed up this far before conversion, discard old chunks down to the target. A chunk
+/// is normally 10 ms. This is deliberately above normal network bursts (observed around 130 ms).
+const MAX_INPUT_CHUNKS: usize = 35;
+const TARGET_INPUT_CHUNKS: usize = 12;
+/// Playback speed change used to steer the buffer
+const NUDGE: f64 = 0.02;
 
 struct Buffer {
     samples: VecDeque<f32>,
     /// Waiting for START_MS before playing (at start and after running dry)
     priming: bool,
+    /// Times it ran dry (audible gaps) and times old audio was dropped, since the last report
+    gaps: u32,
+    trims: u32,
+    input_dropped: u32,
+    min_len: usize,
+    max_len: usize,
 }
 
 /// Converts 16-bit interleaved chunks at any rate to f32 at the device rate and channel count
@@ -31,6 +50,8 @@ struct Converter {
     out_channels: usize,
     /// Position in the input, in input frames, carried across chunks
     pos: f64,
+    /// Playback speed (1 = normal)
+    speed: f64,
     prev: Vec<f32>,
 }
 
@@ -44,7 +65,7 @@ impl Converter {
         if self.prev.len() != ch {
             self.prev = vec![0.0; ch];
         }
-        let step = f64::from(a.rate) / f64::from(self.out_rate);
+        let step = f64::from(a.rate) / f64::from(self.out_rate) * self.speed;
         let sample = |i: isize, c: usize| -> f32 {
             if i < 0 { self.prev[c] } else { f32::from(frames[i as usize][c]) / 32768.0 }
         };
@@ -96,7 +117,15 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
     let config = supported.config();
     let (rate, channels) = (config.sample_rate, usize::from(config.channels));
     let per_ms = rate as usize * channels / 1000;
-    let buf = Arc::new(Mutex::new(Buffer { samples: VecDeque::new(), priming: true }));
+    let buf = Arc::new(Mutex::new(Buffer {
+        samples: VecDeque::new(),
+        priming: true,
+        gaps: 0,
+        trims: 0,
+        input_dropped: 0,
+        min_len: usize::MAX,
+        max_len: 0,
+    }));
 
     // the stream must stay on the thread that made it, so a thread owns it for the rest of the run
     let out = buf.clone();
@@ -133,15 +162,65 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
     std::thread::Builder::new()
         .name("audio-feed".into())
         .spawn(move || {
-            let mut conv = Converter { out_rate: rate, out_channels: channels, pos: 0.0, prev: Vec::new() };
-            while let Ok(chunk) = rx.recv() {
+            let mut conv = Converter { out_rate: rate, out_channels: channels, pos: 0.0, speed: 1.0, prev: Vec::new() };
+            let mut converted = VecDeque::new();
+            let mut report = std::time::Instant::now();
+            while let Ok(first) = rx.recv() {
+                let mut chunks = vec![first];
+                chunks.extend(rx.try_iter());
+                let dropped = if chunks.len() > MAX_INPUT_CHUNKS {
+                    let keep_from = chunks.len().saturating_sub(TARGET_INPUT_CHUNKS);
+                    chunks.drain(..keep_from);
+                    keep_from
+                } else {
+                    0
+                };
+                if dropped > 0 {
+                    // Do not interpolate between samples that were separated by a deliberate latency trim.
+                    conv.pos = 0.0;
+                    conv.prev.clear();
+                }
+                for chunk in chunks {
+                    // Read only the steering state while locked. Resampling and temporary allocation must not
+                    // make the real-time device callback wait for this mutex.
+                    let (held, priming) = {
+                        let b = buf.lock().unwrap();
+                        (b.samples.len() / per_ms, b.priming)
+                    };
+                    conv.speed = if held > HIGH_MS {
+                        1.0 + NUDGE
+                    } else if held < LOW_MS && !priming {
+                        1.0 - NUDGE
+                    } else {
+                        1.0
+                    };
+                    conv.push(&chunk, &mut converted);
+                    let mut b = buf.lock().unwrap();
+                    b.samples.append(&mut converted);
+                    b.max_len = b.max_len.max(b.samples.len());
+                    let max = MAX_MS * per_ms;
+                    if b.samples.len() > max {
+                        let extra = b.samples.len() - TARGET_MS * per_ms;
+                        let extra = extra - extra % channels;
+                        b.samples.drain(..extra);
+                        b.trims += 1;
+                    }
+                }
                 let mut b = buf.lock().unwrap();
-                conv.push(&chunk, &mut b.samples);
-                let max = MAX_MS * per_ms;
-                if b.samples.len() > max {
-                    let extra = b.samples.len() - START_MS * per_ms;
-                    let extra = extra - extra % channels;
-                    b.samples.drain(..extra);
+                b.input_dropped = b.input_dropped.saturating_add(dropped as u32);
+                if report.elapsed() >= std::time::Duration::from_secs(10) {
+                    if b.gaps > 0 || b.trims > 0 || b.input_dropped > 0 {
+                        log::info!(
+                            "audio: {} gaps, {} output trims, {} input chunks dropped in 10 s, buffer {}..{} ms",
+                            b.gaps,
+                            b.trims,
+                            b.input_dropped,
+                            if b.min_len == usize::MAX { 0 } else { b.min_len / per_ms },
+                            b.max_len / per_ms
+                        );
+                    }
+                    (b.gaps, b.trims, b.input_dropped, b.min_len, b.max_len) = (0, 0, 0, usize::MAX, 0);
+                    report = std::time::Instant::now();
                 }
             }
         })
@@ -171,8 +250,12 @@ where
                 let v = if b.priming { 0.0 } else { b.samples.pop_front().unwrap_or(0.0) };
                 *slot = T::from_sample(if mute { 0.0 } else { v });
             }
+            if !b.priming {
+                b.min_len = b.min_len.min(b.samples.len());
+            }
             if !b.priming && b.samples.is_empty() {
                 b.priming = true;
+                b.gaps += 1;
             }
         },
         |e| log::warn!("audio output error: {e}"),
@@ -190,7 +273,7 @@ mod tests {
 
     #[test]
     fn same_rate_passes_through() {
-        let mut c = Converter { out_rate: 48_000, out_channels: 2, pos: 0.0, prev: Vec::new() };
+        let mut c = Converter { out_rate: 48_000, out_channels: 2, pos: 0.0, speed: 1.0, prev: Vec::new() };
         let mut out = VecDeque::new();
         let a: Vec<i16> = (0..960).map(|i| (i * 10) as i16).collect();
         c.push(&chunk(48_000, a.clone()), &mut out);
@@ -201,7 +284,7 @@ mod tests {
 
     #[test]
     fn resamples_to_44_1_khz_and_mono() {
-        let mut c = Converter { out_rate: 44_100, out_channels: 1, pos: 0.0, prev: Vec::new() };
+        let mut c = Converter { out_rate: 44_100, out_channels: 1, pos: 0.0, speed: 1.0, prev: Vec::new() };
         let mut out = VecDeque::new();
         for _ in 0..100 {
             c.push(&chunk(48_000, vec![1000; 960]), &mut out);

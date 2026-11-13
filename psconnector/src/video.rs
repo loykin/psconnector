@@ -76,7 +76,13 @@ pub struct Assembler {
     header: Vec<u8>,
     pending: BTreeMap<u16, Pending>,
     last_done: Option<u16>,
+    /// Units in a row that looked older than the last finished frame
+    stale_run: u32,
 }
+
+/// That many "old" units in a row means the console restarted its frame numbering (it does so when it
+/// changes the stream, e.g. after adapting to the network): start following the new numbers.
+const RESYNC_AFTER: u32 = 120;
 
 pub enum Assembled {
     /// A complete H.264 frame
@@ -87,7 +93,7 @@ pub enum Assembled {
 
 impl Assembler {
     pub fn new(header: Vec<u8>) -> Self {
-        Self { header, pending: BTreeMap::new(), last_done: None }
+        Self { header, pending: BTreeMap::new(), last_done: None, stale_run: 0 }
     }
 
     /// Adds one decrypted unit.
@@ -98,9 +104,16 @@ impl Assembler {
         if let Some(done) = self.last_done {
             // already finished or too old (u16 wrap-around aware)
             if frame.wrapping_sub(done) == 0 || frame.wrapping_sub(done) > 0x8000 {
-                return;
+                self.stale_run += 1;
+                if self.stale_run < RESYNC_AFTER {
+                    return;
+                }
+                log::info!("video frame numbers restarted ({done} → {frame}); following them");
+                self.last_done = None;
+                self.pending.clear();
             }
         }
+        self.stale_run = 0;
         let p = self.pending.entry(frame).or_insert_with(|| Pending { src, units: vec![None; src as usize], have: 0 });
         let slot = &mut p.units[unit as usize];
         if slot.is_none() {
@@ -130,11 +143,49 @@ impl Assembler {
     }
 }
 
+/// Decoding speed, logged every 10 s.
+#[derive(Default)]
+struct DecodeStats {
+    since: Option<std::time::Instant>,
+    decoded: u32,
+    shown: u32,
+    skipped: u32,
+    queue: std::time::Duration,
+    max_queue: std::time::Duration,
+    decode: std::time::Duration,
+    convert: std::time::Duration,
+}
+
+impl DecodeStats {
+    fn report(&mut self) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < std::time::Duration::from_secs(10) {
+            return;
+        }
+        let ms = |d: std::time::Duration, n: u32| d.as_secs_f64() * 1000.0 / f64::from(n.max(1));
+        log::info!(
+            "video: {} frames decoded ({:.1} ms each, queue {:.1} ms avg/{:.1} ms max), {} shown ({:.1} ms to RGB), {} skipped to catch up",
+            self.decoded,
+            ms(self.decode, self.decoded),
+            ms(self.queue, self.decoded),
+            self.max_queue.as_secs_f64() * 1000.0,
+            self.shown,
+            ms(self.convert, self.shown),
+            self.skipped
+        );
+        *self = Self { since: Some(std::time::Instant::now()), ..Self::default() };
+    }
+}
+
 /// Decoder thread. Decodes incoming frames and publishes the latest picture on a watch channel.
 /// Frames are decoded in order even when behind (H.264 needs the earlier frames).
+///
+/// If the decoder keeps failing (it can get stuck after a damaged frame), it asks the stream for a key frame
+/// through `need_key`, and after a while starts a fresh decoder.
 pub fn spawn_decoder(
-    rx: std::sync::mpsc::Receiver<(u16, Vec<u8>)>,
+    rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
     out: watch::Sender<Option<Arc<Frame>>>,
+    need_key: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("psconnector-video".into())
@@ -147,18 +198,97 @@ pub fn spawn_decoder(
                 }
             };
             let mut rgb = Vec::new();
-            while let Ok((index, h264)) = rx.recv() {
-                match dec.decode(&h264) {
-                    Ok(Some(yuv)) => {
+            // Frames returned by the watch channel can be reused once the UI has released its Arc. Keeping a
+            // few candidates avoids both the 6 MB rgb.clone() and a fresh allocation for every 1080p frame.
+            let mut reusable = Vec::new();
+            let mut stats = DecodeStats::default();
+            // frames in a row that gave no picture
+            let mut failing = 0u32;
+            let mut next = rx.recv().ok();
+            while let Some((index, queued_at, h264)) = next.take() {
+                let queued = queued_at.elapsed();
+                let t0 = std::time::Instant::now();
+                let decoded = dec.decode(&h264);
+                let t_decode = t0.elapsed();
+                // when more frames are already waiting, only decode this one (later frames need it) and skip
+                // turning it into a picture nobody will see; this keeps the screen from falling behind
+                let waiting = rx.try_recv();
+                let behind = waiting.is_ok();
+                match &decoded {
+                    Ok(Some(_)) => failing = 0,
+                    _ => failing += 1,
+                }
+                if failing > 0 && failing.is_multiple_of(10) {
+                    need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                match decoded {
+                    Ok(Some(yuv)) if !behind => {
+                        let t1 = std::time::Instant::now();
                         let (w, h) = yuv.dimensions();
+                        if rgb.capacity() < w * h * 3
+                            && let Some(at) = reusable.iter().position(|f: &Arc<Frame>| Arc::strong_count(f) == 1)
+                            && let Ok(frame) = Arc::try_unwrap(reusable.swap_remove(at))
+                        {
+                            rgb = frame.rgb;
+                        }
                         rgb.resize(w * h * 3, 0);
                         yuv.write_rgb8(&mut rgb);
-                        let _ = out.send(Some(Arc::new(Frame { width: w, height: h, rgb: rgb.clone(), index })));
+                        let frame = Arc::new(Frame { width: w, height: h, rgb: std::mem::take(&mut rgb), index });
+                        if let Some(old) = out.send_replace(Some(frame)) {
+                            reusable.push(old);
+                            if reusable.len() > 8 {
+                                reusable.remove(0);
+                            }
+                        }
+                        stats.shown += 1;
+                        stats.convert += t1.elapsed();
                     }
-                    Ok(None) => {}
+                    Ok(_) => stats.skipped += u32::from(behind),
                     Err(e) => debug!("failed to decode frame {index}: {e}"),
                 }
+                stats.decoded += 1;
+                stats.queue += queued;
+                stats.max_queue = stats.max_queue.max(queued);
+                stats.decode += t_decode;
+                stats.report();
+                if failing >= 60 {
+                    log::info!("video decoder stuck after a damaged frame; starting a fresh one");
+                    match Decoder::new() {
+                        Ok(d) => dec = d,
+                        Err(e) => warn!("cannot restart the H.264 decoder: {e}"),
+                    }
+                    failing = 0;
+                }
+                next = match waiting {
+                    Ok(f) => Some(f),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => rx.recv().ok(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                };
             }
         })
         .expect("video thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(a: &mut Assembler, frame: u16) -> usize {
+        let mut out = Vec::new();
+        a.push(frame, 0, 1, vec![0, 0, 9], &mut out);
+        out.iter().filter(|x| matches!(x, Assembled::Frame(..))).count()
+    }
+
+    #[test]
+    fn follows_restarted_frame_numbers() {
+        let mut a = Assembler::new(vec![]);
+        for f in 5000..5010 {
+            assert_eq!(unit(&mut a, f), 1);
+        }
+        // the console starts over at 0: ignored at first, then followed
+        let got: usize = (0..200).map(|f| unit(&mut a, f)).sum();
+        assert!(got >= 70, "frames after the restart: {got}");
+        // a stray old unit afterwards is still ignored
+        assert_eq!(unit(&mut a, 150), 0);
+    }
 }

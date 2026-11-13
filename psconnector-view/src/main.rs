@@ -46,6 +46,7 @@ use tokio::net::TcpListener;
 mod login_window;
 mod ocr;
 mod pad;
+mod picture;
 mod quality;
 mod settings;
 mod setup;
@@ -90,9 +91,22 @@ struct Shared {
     /// The session is over; its threads and tasks stop
     ended: AtomicBool,
     serve_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Picture adjustment for the window, and a counter bumped on every change
+    picture: Mutex<picture::Picture>,
+    picture_version: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
+    /// Changes the picture adjustment and remembers it for next time.
+    fn set_picture(&self, p: picture::Picture) {
+        *self.picture.lock().unwrap() = p;
+        self.picture_version.fetch_add(1, Ordering::SeqCst);
+        settings::set("picture", p.to_json());
+        if let Some(ctx) = self.ctx.get() {
+            ctx.request_repaint();
+        }
+    }
+
     fn client(&self) -> Arc<Client> {
         self.client.read().unwrap().clone()
     }
@@ -365,6 +379,7 @@ impl eframe::App for App {
                     match start_session(&self.rt, &self.launch, &self.outputs, host, client) {
                         Ok((shared, runner)) => {
                             let _ = shared.ctx.set(ctx.clone());
+                            spawn_frame_repaint(shared.clone());
                             *self.session.lock().unwrap() = Some(shared.clone());
                             self.state = State::Viewer(Box::new(Viewer {
                                 shared,
@@ -372,6 +387,11 @@ impl eframe::App for App {
                                 shown: None,
                                 runner,
                                 fps: FpsMeter::default(),
+                                lut: None,
+                                adjusted: Vec::new(),
+                                picture_open: false,
+                                preset_name: String::new(),
+                                upload: (0, Duration::ZERO, None),
                             }));
                         }
                         Err(e) => {
@@ -415,6 +435,10 @@ fn start_session(
         leave: AtomicBool::new(false),
         ended: AtomicBool::new(false),
         serve_task: Mutex::new(None),
+        picture: Mutex::new(
+            settings::get("picture").map(|v| picture::Picture::default().merged(&v)).unwrap_or_default(),
+        ),
+        picture_version: std::sync::atomic::AtomicU64::new(1),
     });
     shared.attach_audio(&client);
     let listener = rt
@@ -484,6 +508,26 @@ fn spawn_supervisor(sh: Arc<Shared>, rt: tokio::runtime::Handle) {
         .expect("supervisor thread");
 }
 
+/// Wakes egui as soon as the decoder publishes a frame. The outer loop follows a replacement Client after
+/// a quality change; the slow periodic repaint in Viewer remains for status text and other non-frame state.
+fn spawn_frame_repaint(sh: Arc<Shared>) {
+    std::thread::Builder::new()
+        .name("frame-repaint".into())
+        .spawn(move || {
+            while !sh.ended.load(Ordering::SeqCst) {
+                let client = sh.client();
+                let mut frames = client.frames();
+                while !sh.ended.load(Ordering::SeqCst) && sh.rt.block_on(frames.changed()).is_ok() {
+                    if let Some(ctx) = sh.ctx.get() {
+                        ctx.request_repaint();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .expect("frame repaint thread");
+}
+
 /// Waits for Ctrl+C (and SIGTERM on Unix).
 async fn wait_for_quit_signal() {
     #[cfg(unix)]
@@ -499,13 +543,14 @@ async fn wait_for_quit_signal() {
 }
 
 /// The console keeps reporting "another session connected" (and sometimes refuses the connection) for a
-/// while after the previous session ends — anywhere from a few seconds to about 40 — so keep retrying.
+/// while after the previous session ends. It is usually quick, but has taken over 90 seconds in practice,
+/// so keep retrying long enough that a quality change does not fall back just before the console is ready.
 async fn connect(host: &str, opts: Options) -> Result<Client> {
     let t0 = Instant::now();
     loop {
         match Client::connect(host, opts.clone()).await {
             Ok(c) => return Ok(c),
-            Err(e) if t0.elapsed() < Duration::from_secs(90) && is_transient(&e) => {
+            Err(e) if t0.elapsed() < Duration::from_secs(180) && is_transient(&e) => {
                 println!("previous session still active ({e}), retrying in 3 s");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -1081,6 +1126,13 @@ struct Viewer {
     shown: Option<Arc<Frame>>,
     runner: Arc<Mutex<Runner>>,
     fps: FpsMeter,
+    /// Picture adjustment: tables for the version in use, the adjusted frame, and the settings window
+    lut: Option<(u64, picture::Lut)>,
+    adjusted: Vec<u8>,
+    picture_open: bool,
+    preset_name: String,
+    /// Time spent turning frames into the window texture, logged every 10 s
+    upload: (u32, Duration, Option<Instant>),
 }
 
 /// Frames shown per second, over the last second.
@@ -1214,6 +1266,12 @@ impl Viewer {
                     self.shared.client().standby();
                     self.shared.leave.store(true, Ordering::SeqCst);
                 }
+                if theme::ghost(ui, true, "Picture")
+                    .on_hover_text("Brightness, contrast and colour of the picture")
+                    .clicked()
+                {
+                    self.picture_open = !self.picture_open;
+                }
                 if theme::ghost(ui, true, "Disconnect")
                     .on_hover_text("Close the connection and go back to the start screen")
                     .clicked()
@@ -1261,6 +1319,75 @@ impl Viewer {
 }
 
 impl Viewer {
+    /// Saved presets (name → values) from the settings file.
+    fn saved_presets() -> Vec<(String, picture::Picture)> {
+        settings::get("picture_presets")
+            .and_then(|v| v.as_object().cloned())
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), picture::Picture::default().merged(v))).collect())
+            .unwrap_or_default()
+    }
+
+    fn picture_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.picture_open;
+        let mut p = *self.shared.picture.lock().unwrap();
+        let before = p;
+        egui::Window::new("Picture").open(&mut open).resizable(false).default_width(300.0).show(ctx, |ui| {
+            ui.label(theme::muted(ui, "Changes only what you see here; macros and screenshots get the original."));
+            let presets: Vec<(String, picture::Picture)> =
+                picture::builtin().into_iter().map(|(n, v)| (n.to_string(), v)).chain(Self::saved_presets()).collect();
+            let current =
+                presets.iter().find(|(_, v)| *v == p).map(|(n, _)| n.clone()).unwrap_or_else(|| "Custom".into());
+            egui::ComboBox::from_id_salt("picture_preset").selected_text(current).width(220.0).show_ui(ui, |ui| {
+                for (name, v) in &presets {
+                    if ui.selectable_label(*v == p, name).clicked() {
+                        p = *v;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("picture_sliders").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Shadows");
+                ui.add(egui::Slider::new(&mut p.shadows, 0.0..=1.0)).on_hover_text("Lift dark areas");
+                ui.end_row();
+                ui.label("Highlights");
+                ui.add(egui::Slider::new(&mut p.highlights, 0.0..=1.0)).on_hover_text("Pull bright areas down");
+                ui.end_row();
+                ui.label("Contrast");
+                ui.add(egui::Slider::new(&mut p.contrast, -0.5..=0.5));
+                ui.end_row();
+                ui.label("Saturation");
+                ui.add(egui::Slider::new(&mut p.saturation, 0.0..=1.5));
+                ui.end_row();
+                ui.label("Warmth");
+                ui.add(egui::Slider::new(&mut p.warmth, -1.0..=1.0))
+                    .on_hover_text("Less blue (right) or more blue (left)");
+                ui.end_row();
+                ui.label("Shadow tint");
+                ui.add(egui::Slider::new(&mut p.shadow_tint, 0.0..=1.0))
+                    .on_hover_text("Take the colour cast out of dark areas");
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Reset").clicked() {
+                    p = picture::Picture::default();
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(120.0).hint_text("preset name"));
+                if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                    let mut all = settings::get("picture_presets")
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    all[self.preset_name.trim()] = p.to_json();
+                    settings::set("picture_presets", all);
+                    self.preset_name.clear();
+                }
+            });
+        });
+        self.picture_open = open;
+        if p != before {
+            self.shared.set_picture(p);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let quit = QUIT.load(Ordering::SeqCst);
@@ -1272,16 +1399,48 @@ impl Viewer {
         egui::Panel::top("bar").show(ui, |ui| self.bar(ui));
 
         let latest = self.shared.client().frame();
+        let version = self.shared.picture_version.load(Ordering::SeqCst);
+        let picture_changed = self.lut.as_ref().is_none_or(|(v, _)| *v != version);
+        if picture_changed {
+            let p = *self.shared.picture.lock().unwrap();
+            self.lut = Some((version, picture::Lut::new(&p)));
+        }
+        let neutral = self.shared.picture.lock().unwrap().is_neutral();
         if let Some(f) = latest
-            && !self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f))
+            && (picture_changed || !self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f)))
         {
-            let img = egui::ColorImage::from_rgb([f.width, f.height], &f.rgb);
+            let new_frame = !self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f));
+            let t0 = Instant::now();
+            let img = if neutral {
+                egui::ColorImage::from_rgb([f.width, f.height], &f.rgb)
+            } else {
+                let (_, lut) = self.lut.as_ref().expect("lut");
+                lut.apply(&f.rgb, &mut self.adjusted);
+                egui::ColorImage::from_rgb([f.width, f.height], &self.adjusted)
+            };
             match &mut self.texture {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("ps5", img, egui::TextureOptions::LINEAR)),
             }
             self.shown = Some(f);
-            self.fps.frame();
+            if new_frame {
+                self.fps.frame();
+            }
+            let (n, total, since) = &mut self.upload;
+            *n += 1;
+            *total += t0.elapsed();
+            let since = *since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(10) {
+                log::info!(
+                    "window: {} frames shown in 10 s, {:.1} ms each to adjust and upload",
+                    *n,
+                    total.as_secs_f64() * 1000.0 / f64::from((*n).max(1))
+                );
+                self.upload = (0, Duration::ZERO, Some(Instant::now()));
+            }
+        }
+        if self.picture_open {
+            self.picture_window(&ctx);
         }
         // draw into the remaining area at 16:9
         let area = ui.available_rect_before_wrap();
@@ -1319,7 +1478,8 @@ impl Viewer {
             );
             painter.galley(pos, galley, egui::Color32::WHITE);
         }
-        ctx.request_repaint_after(Duration::from_millis(15));
+        // Frames wake the window immediately; this slower tick is for OSD, connection state and controls.
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
@@ -1463,6 +1623,25 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
                 "height": f.as_ref().map(|f| f.height),
             })
         )));
+    } else if let Some(v) = m.get("picture") {
+        // {"picture": {"shadows": 0.5, ...}} changes those values; {"picture": "preset name"} loads a preset;
+        // {"picture": ""} only reports. Reply: ok {current values}
+        let cur = *sh.picture.lock().unwrap();
+        let next = match v {
+            Value::Object(_) => Some(cur.merged(v)),
+            Value::String(name) if !name.is_empty() => Some(
+                picture::builtin()
+                    .into_iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, p)| p)
+                    .ok_or_else(|| anyhow!("no picture preset named '{name}'"))?,
+            ),
+            _ => None,
+        };
+        if let Some(p) = next {
+            sh.set_picture(p);
+        }
+        return Ok(Reply::Text(format!("ok {}", sh.picture.lock().unwrap().to_json())));
     } else if m.get("should_stop").is_some() {
         let yes = sh.runner.lock().unwrap().should_stop();
         return Ok(Reply::Text(if yes { "ok yes" } else { "ok no" }.into()));

@@ -96,8 +96,9 @@ impl Client {
         let (frame_tx, frame_rx) = watch::channel(None);
         let (video_tx, cfg) = if opts.video {
             let (tx, rx) = std::sync::mpsc::channel();
-            video::spawn_decoder(rx, frame_tx);
-            (Some(tx), opts.stream)
+            let need_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            video::spawn_decoder(rx, frame_tx, need_key.clone());
+            (Some((tx, need_key)), opts.stream)
         } else {
             (None, StreamConfig::minimal())
         };

@@ -27,6 +27,8 @@ const TAG_LOCAL: u32 = 1;
 const DATA_ACK_LENGTH: usize = 29;
 /// The stick state is re-sent at this interval even when unchanged (as chiaki does).
 const STATE_INTERVAL: Duration = Duration::from_millis(200);
+/// UDP receive buffer for the stream (the macOS default is about 0.8 MB)
+const RECV_BUFFER: usize = 4 << 20;
 const CONGESTION_INTERVAL: Duration = Duration::from_millis(500);
 /// Delay before re-sending a button event packet unchanged. Guards against losing the last event
 /// (usually a release).
@@ -55,21 +57,30 @@ impl StreamConfig {
 }
 
 /// Channel for sending complete H.264 frames to the decoder thread.
-pub type VideoTx = std::sync::mpsc::Sender<(u16, Vec<u8>)>;
+pub type VideoTx = std::sync::mpsc::Sender<(u16, std::time::Instant, Vec<u8>)>;
 
 /// Where decoded-to-be video and audio go (None = not wanted)
 pub(crate) struct Outputs {
-    pub video: Option<VideoTx>,
+    pub video: Option<(VideoTx, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     pub audio: Option<AudioTx>,
 }
 
 struct AudioState {
     tx: AudioTx,
     reorder: Reorder,
+    /// Frames lost (filled by concealment) and received since the last report
+    lost: u32,
+    frames: u32,
+    since: Instant,
+    /// Longest wait between two audio packets since the last report
+    last_packet: Option<Instant>,
+    max_gap: Duration,
 }
 
 struct VideoState {
     tx: VideoTx,
+    /// Set by the decoder when it needs a key frame to recover
+    need_key: std::sync::Arc<std::sync::atomic::AtomicBool>,
     assembler: Option<Assembler>,
     last_corrupt: Option<Instant>,
 }
@@ -202,13 +213,19 @@ impl Stream {
                         None => warn!("STREAMINFO has no usable audio header"),
                     }
                 }
-                if let Some(v) = self.video.as_mut().filter(|v| v.assembler.is_none()) {
+                if let Some(v) = self.video.as_mut() {
                     let header = msg
                         .stream_info_payload
                         .and_then(|i| i.resolution.into_iter().next())
                         .and_then(|r| r.video_header)
                         .unwrap_or_default();
-                    info!("got {}-byte video header", header.len());
+                    // the console sends this again when it changes the stream (resolution, after adapting to
+                    // the network); frame numbers start over then, so start a fresh assembler
+                    if v.assembler.is_some() {
+                        info!("stream changed: new {}-byte video header", header.len());
+                    } else {
+                        info!("got {}-byte video header", header.len());
+                    }
                     v.assembler = Some(Assembler::new(header));
                 }
                 self.send_data(&proto::simple(PayloadType::StreamInfoAck), 9, true).await;
@@ -232,10 +249,30 @@ impl Stream {
     fn handle_audio(&mut self, pkt: &[u8]) {
         let (Some(c), Some(a)) = (self.cipher.as_ref(), self.audio.as_mut()) else { return };
         let Some(p) = audio::parse(pkt) else { return };
+        let now = Instant::now();
+        if let Some(prev) = a.last_packet {
+            a.max_gap = a.max_gap.max(now - prev);
+        }
+        a.last_packet = Some(now);
         let mut data = p.data.to_vec();
         c.remote.xor(p.key_pos, &mut data);
         for frame in a.reorder.push(p.frame, p.src, p.fec, p.unit_size, &data) {
+            a.frames += 1;
+            if frame.is_none() {
+                a.lost += 1;
+            }
             let _ = a.tx.send(AudioMsg::Frame(frame));
+        }
+        if a.since.elapsed() >= Duration::from_secs(10) {
+            if a.lost > 0 || a.max_gap > Duration::from_millis(250) {
+                info!(
+                    "audio: {} of {} frames lost in 10 s (concealed), longest wait between packets {} ms",
+                    a.lost,
+                    a.frames,
+                    a.max_gap.as_millis()
+                );
+            }
+            (a.lost, a.frames, a.since, a.max_gap) = (0, 0, Instant::now(), Duration::ZERO);
         }
     }
 
@@ -252,10 +289,13 @@ impl Stream {
         for a in out {
             match a {
                 Assembled::Frame(i, h264) => {
-                    let _ = v.tx.send((i, h264));
+                    let _ = v.tx.send((i, std::time::Instant::now(), h264));
                 }
                 Assembled::Lost(start, end) => lost = Some((start, end)),
             }
+        }
+        if lost.is_none() && v.need_key.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            lost = Some((p.frame, p.frame));
         }
         if let Some((start, end)) = lost
             && v.last_corrupt.is_none_or(|t| t.elapsed() > Duration::from_millis(200))
@@ -277,6 +317,11 @@ pub async fn run(
     out: Outputs,
 ) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
+    // video key frames arrive as bursts of hundreds of packets; a bigger receive buffer keeps the OS from
+    // dropping some of them while this task is busy
+    if let Err(e) = socket2::SockRef::from(&sock).set_recv_buffer_size(RECV_BUFFER) {
+        debug!("cannot enlarge the UDP receive buffer: {e}");
+    }
     sock.connect((host.as_str(), PORT)).await?;
     let mut s = Stream {
         sock,
@@ -289,8 +334,16 @@ pub async fn run(
         sticks: Sticks::default(),
         av_received: 0,
         phase,
-        video: out.video.map(|tx| VideoState { tx, assembler: None, last_corrupt: None }),
-        audio: out.audio.map(|tx| AudioState { tx, reorder: Reorder::default() }),
+        video: out.video.map(|(tx, need_key)| VideoState { tx, need_key, assembler: None, last_corrupt: None }),
+        audio: out.audio.map(|tx| AudioState {
+            tx,
+            reorder: Reorder::default(),
+            lost: 0,
+            frames: 0,
+            since: Instant::now(),
+            last_packet: None,
+            max_gap: Duration::ZERO,
+        }),
     };
     s.control(chunk::INIT, &takion::init_payload(TAG_LOCAL, s.tsn), 0).await;
 
@@ -301,14 +354,32 @@ pub async fn run(
     let mut resend: Option<(Instant, Vec<u8>)> = None;
     let far = Instant::now() + Duration::from_secs(3600 * 24);
     let started = Instant::now();
+    let mut recv_errors = 0u8;
+    // A non-stick command found while coalescing stick motion. Keeping it here preserves the FIFO boundary
+    // between state changes and ordered button events.
+    let mut pending_cmd = None;
 
     loop {
         let resend_at = resend.as_ref().map(|r| r.0).unwrap_or(far);
         tokio::select! {
             r = s.sock.recv(&mut buf) => {
                 let n = match r {
-                    Ok(n) => n,
-                    Err(e) => { warn!("UDP receive error: {e}"); continue; }
+                    Ok(n) => {
+                        recv_errors = 0;
+                        n
+                    }
+                    Err(e) => {
+                        recv_errors += 1;
+                        if recv_errors >= 5 {
+                            let _ = s.phase.send(Phase::Closed(format!("UDP receive failed repeatedly: {e}")));
+                            return Err(e.into());
+                        }
+                        warn!("UDP receive error ({recv_errors}/5): {e}");
+                        // Some socket errors can be returned immediately. A short delay prevents a hot loop;
+                        // repeated failures terminate the session above instead of hiding a dead socket.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
                 };
                 let pkt = &buf[..n];
                 if let Some(t) = takion::av_type(pkt) {
@@ -360,7 +431,12 @@ pub async fn run(
                     other => debug!("unhandled chunk {other}"),
                 }
             }
-            c = cmd.recv() => match c {
+            c = async {
+                match pending_cmd.take() {
+                    Some(c) => Some(c),
+                    None => cmd.recv().await,
+                }
+            } => match c {
                 Some(Cmd::Button(b, pressed)) => {
                     if let Some(pkt) = s.send_event(b, pressed).await {
                         resend = Some((Instant::now() + EVENT_RESEND, pkt));
@@ -370,6 +446,24 @@ pub async fn run(
                 }
                 Some(Cmd::Stick { right, x, y }) => {
                     if right { s.sticks.right = (x, y) } else { s.sticks.left = (x, y) }
+                    // Axis events can arrive much faster than the network task under video load. Merge only
+                    // consecutive stick commands; stop at a button/Stop so their relative order is retained.
+                    loop {
+                        match cmd.try_recv() {
+                            Ok(Cmd::Stick { right, x, y }) => {
+                                if right { s.sticks.right = (x, y) } else { s.sticks.left = (x, y) }
+                            }
+                            Ok(other) => {
+                                pending_cmd = Some(other);
+                                break;
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                pending_cmd = Some(Cmd::Stop);
+                                break;
+                            }
+                        }
+                    }
                     s.send_state().await;
                 }
                 Some(Cmd::Stop) | None => {

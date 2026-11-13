@@ -106,6 +106,7 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"macros":true}` / `{"macro_stop":true}` / `{"macro_status":true}` | `ok {JSON}` |
 | `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name optional) | `ok started` / `ok scheduled for …` |
 | `{"should_stop":true}` has the time limit been reached | `ok yes` / `ok no` |
+| `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"Like a Dragon: Hawaii"}` picture adjustment (`""` only reports) | `ok {values}` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
 
 A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.
@@ -118,9 +119,11 @@ A game controller connected to the computer (DualSense over USB or Bluetooth, Xb
 | `720p` | 1280x720, 60 fps, 10 Mbit/s | default |
 | `1080p` | 1920x1080, 60 fps, 15 Mbit/s | playing yourself |
 
-The resolution is agreed when connecting, so changing it in the bar reconnects. The console takes anywhere from a few seconds to about 40 to release the old session, so expect a short wait without a picture. The choice is remembered in `~/.psconnector/settings.json`. Macros keep working across a change: OCR with `rel=` fractions and MCP screenshot regions (always in 1280x720 space) do not depend on the resolution.
+The resolution is agreed when connecting, so changing it in the bar reconnects. The console usually releases the old session within a few seconds, but it can occasionally take more than a minute, so expect a wait without a picture. The choice is remembered in `~/.psconnector/settings.json`. Macros keep working across a change: OCR with `rel=` fractions and MCP screenshot regions (always in 1280x720 space) do not depend on the resolution.
 
-The PS5's sound plays on the computer's default output device, kept within about 0.1 s of the picture. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
+**Picture** in the bar opens brightness controls for the window: shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved by name. It helps games whose image is too contrasty, such as Like a Dragon: Infinite Wealth in Hawaii (preset "Like a Dragon: Hawaii"). Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back. The command port takes `{"picture": {"shadows": 0.5, ...}}` or `{"picture": "preset name"}`.
+
+The PS5's sound plays on the computer's default output device, about 0.1 s behind the picture: at 1080p audio packets can arrive up to ~130 ms apart, so a ~120 ms buffer absorbs that, and playback speed is nudged by 2 % to keep the buffer there instead of skipping. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
 
 Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed cleanly.
 
