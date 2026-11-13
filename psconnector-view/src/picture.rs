@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Picture {
+    /// -0.5 … 0.5 exposure stops
+    pub brightness: f32,
     /// 0 … 1: lift dark areas
     pub shadows: f32,
     /// 0 … 1: pull bright areas down
@@ -27,7 +29,15 @@ pub struct Picture {
 
 impl Default for Picture {
     fn default() -> Self {
-        Self { shadows: 0.0, highlights: 0.0, contrast: 0.0, saturation: 1.0, warmth: 0.0, shadow_tint: 0.0 }
+        Self {
+            brightness: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            contrast: 0.0,
+            saturation: 1.0,
+            warmth: 0.0,
+            shadow_tint: 0.0,
+        }
     }
 }
 
@@ -38,7 +48,7 @@ impl Picture {
 
     pub fn to_json(self) -> Value {
         json!({
-            "shadows": self.shadows, "highlights": self.highlights, "contrast": self.contrast,
+            "brightness": self.brightness, "shadows": self.shadows, "highlights": self.highlights, "contrast": self.contrast,
             "saturation": self.saturation, "warmth": self.warmth, "shadow_tint": self.shadow_tint,
         })
     }
@@ -47,6 +57,7 @@ impl Picture {
     pub fn merged(self, v: &Value) -> Self {
         let get = |k: &str, cur: f32| v[k].as_f64().map(|x| x as f32).unwrap_or(cur);
         Self {
+            brightness: get("brightness", self.brightness).clamp(-0.5, 0.5),
             shadows: get("shadows", self.shadows).clamp(0.0, 1.0),
             highlights: get("highlights", self.highlights).clamp(0.0, 1.0),
             contrast: get("contrast", self.contrast).clamp(-0.5, 0.5),
@@ -58,6 +69,7 @@ impl Picture {
 
     /// Brightness curve on 0…1 luminance.
     fn curve(&self, x: f32) -> f32 {
+        let x = (x * 2.0f32.powf(self.brightness)).clamp(0.0, 1.0);
         // shadows: a gamma lift that fades out towards the bright end, so mid tones and highlights stay put
         let lifted = x.powf(1.0 / (1.0 + self.shadows * 1.5));
         let w = (1.0 - x) * (1.0 - x);
@@ -166,8 +178,15 @@ mod tests {
 
     #[test]
     fn adjustment_lifts_shadows_keeps_black_neutral_and_curve_rising() {
-        let p =
-            Picture { shadows: 0.6, highlights: 0.8, contrast: -0.05, saturation: 0.85, warmth: 0.3, shadow_tint: 0.7 };
+        let p = Picture {
+            brightness: -0.2,
+            shadows: 0.6,
+            highlights: 0.8,
+            contrast: -0.05,
+            saturation: 0.85,
+            warmth: 0.3,
+            shadow_tint: 0.7,
+        };
         let lut = Lut::new(&p);
         let mut out = Vec::new();
         // a near-black, slightly blue pixel: lifted, but not turned purple

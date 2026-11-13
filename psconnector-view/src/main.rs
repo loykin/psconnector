@@ -1507,6 +1507,9 @@ impl Viewer {
             });
             ui.add_space(4.0);
             egui::Grid::new("picture_sliders").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Brightness");
+                ui.add(egui::Slider::new(&mut p.brightness, -0.5..=0.5)).on_hover_text("Overall exposure");
+                ui.end_row();
                 ui.label("Shadows");
                 ui.add(egui::Slider::new(&mut p.shadows, 0.0..=1.0)).on_hover_text("Lift dark areas");
                 ui.end_row();
