@@ -99,11 +99,11 @@ struct Shared {
 }
 
 impl Shared {
-    /// Changes the picture adjustment and remembers it for next time.
+    /// Changes the picture adjustment for this session. Named presets are persisted separately;
+    /// a new session always starts from the untouched picture.
     fn set_picture(&self, p: picture::Picture) {
         *self.picture.lock().unwrap() = p;
         self.picture_version.fetch_add(1, Ordering::SeqCst);
-        settings::set("picture", p.to_json());
         if let Some(ctx) = self.ctx.get() {
             ctx.request_repaint();
         }
@@ -112,7 +112,6 @@ impl Shared {
     fn set_video_range(&self, range: VideoRange) {
         *self.video_range.lock().unwrap() = range;
         self.client().set_video_range(range);
-        settings::set("video_range", Value::String(video_range_name(range).into()));
     }
 
     fn client(&self) -> Arc<Client> {
@@ -192,7 +191,6 @@ impl Shared {
                     *sh.quality.lock().unwrap() = got;
                     *sh.video_codec.lock().unwrap() = got_codec;
                     quality::save(got);
-                    settings::set("video_codec", Value::String(video_codec_name(got_codec).into()));
                     log::info!("connected at {} / {}", got.label(), video_codec_name(got_codec));
                     *sh.reconnecting.lock().unwrap() = None;
                 }
@@ -283,10 +281,13 @@ fn main() -> Result<()> {
         macro_sources = default_macro_sources();
     }
     let quality = quality.or_else(quality::saved).unwrap_or(Quality::Hd720);
-    let video_codec =
-        settings::get("video_codec").and_then(|v| v.as_str().and_then(parse_video_codec)).unwrap_or(VideoCodec::H264);
-    let video_range =
-        settings::get("video_range").and_then(|v| v.as_str().and_then(parse_video_range)).unwrap_or(VideoRange::Auto);
+    // Picture/range/codec are deliberately session-scoped. Most games should always start untouched;
+    // game-specific combinations live in named presets and are selected only when needed.
+    let video_codec = VideoCodec::H264;
+    let video_range = VideoRange::Auto;
+    for legacy_global in ["picture", "video_codec", "video_range"] {
+        settings::remove(legacy_global);
+    }
     // turned off when signing out of an account that came from pyremoteplay
     psconnector::profile::set_read_pyremoteplay(
         settings::get("read_pyremoteplay").and_then(|v| v.as_bool()) != Some(false),
@@ -520,9 +521,7 @@ fn start_session(
         leave: AtomicBool::new(false),
         ended: AtomicBool::new(false),
         serve_task: Mutex::new(None),
-        picture: Mutex::new(
-            settings::get("picture").map(|v| picture::Picture::default().merged(&v)).unwrap_or_default(),
-        ),
+        picture: Mutex::new(picture::Picture::default()),
         picture_version: std::sync::atomic::AtomicU64::new(1),
     });
     shared.attach_audio(&client);
@@ -1404,8 +1403,35 @@ impl Viewer {
 }
 
 impl Viewer {
+    /// Built-ins establish the safe default: every game is untouched unless its own profile is selected.
+    fn builtin_presets() -> Vec<(String, picture::Picture, Option<VideoRange>, Option<VideoCodec>)> {
+        vec![("Original".into(), picture::Picture::default(), Some(VideoRange::Auto), Some(VideoCodec::H264))]
+    }
+
+    fn save_preset(name: &str, p: picture::Picture, range: VideoRange, codec: VideoCodec) {
+        let mut all =
+            settings::get("picture_presets").filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+        all[name] = serde_json::json!({
+            "picture": p.to_json(),
+            "video_range": video_range_name(range),
+            "video_codec": video_codec_name(codec),
+        });
+        settings::set("picture_presets", all);
+    }
+
+    fn delete_preset(name: &str) -> bool {
+        let Some(mut all) = settings::get("picture_presets").filter(Value::is_object) else {
+            return false;
+        };
+        let removed = all.as_object_mut().is_some_and(|o| o.remove(name).is_some());
+        if removed {
+            settings::set("picture_presets", all);
+        }
+        removed
+    }
+
     /// Saved presets (name → values) from the settings file.
-    fn saved_presets() -> Vec<(String, picture::Picture, Option<VideoRange>)> {
+    fn saved_presets() -> Vec<(String, picture::Picture, Option<VideoRange>, Option<VideoCodec>)> {
         settings::get("picture_presets")
             .and_then(|v| v.as_object().cloned())
             .map(|o| {
@@ -1414,11 +1440,16 @@ impl Viewer {
                         // Old presets stored picture fields directly. New presets also carry source range.
                         let values = v.get("picture").unwrap_or(v);
                         let range = v.get("video_range").and_then(Value::as_str).and_then(parse_video_range);
-                        (k.clone(), picture::Picture::default().merged(values), range)
+                        let codec = v.get("video_codec").and_then(Value::as_str).and_then(parse_video_codec);
+                        (k.clone(), picture::Picture::default().merged(values), range, codec)
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn picture_presets() -> Vec<(String, picture::Picture, Option<VideoRange>, Option<VideoCodec>)> {
+        Self::builtin_presets().into_iter().chain(Self::saved_presets()).collect()
     }
 
     fn picture_window(&mut self, ctx: &egui::Context) {
@@ -1459,23 +1490,27 @@ impl Viewer {
             if chosen_range != current_range {
                 self.shared.set_video_range(chosen_range);
             }
-            let presets: Vec<(String, picture::Picture, Option<VideoRange>)> = picture::builtin()
-                .into_iter()
-                .map(|(n, v)| (n.to_string(), v, Some(VideoRange::Auto)))
-                .chain(Self::saved_presets())
-                .collect();
+            let presets = Self::picture_presets();
             let current = presets
                 .iter()
-                .find(|(_, v, range)| *v == p && range.is_none_or(|r| r == current_range))
-                .map(|(n, _, _)| n.clone())
+                .find(|(_, v, range, codec)| {
+                    *v == p && range.is_none_or(|r| r == current_range) && codec.is_none_or(|c| c == current_codec)
+                })
+                .map(|(n, _, _, _)| n.clone())
                 .unwrap_or_else(|| "Custom".into());
-            egui::ComboBox::from_id_salt("picture_preset").selected_text(current).width(220.0).show_ui(ui, |ui| {
-                for (name, v, range) in &presets {
-                    let selected = *v == p && range.is_none_or(|r| r == current_range);
+            egui::ComboBox::from_id_salt("picture_preset").selected_text(&current).width(220.0).show_ui(ui, |ui| {
+                for (name, v, range, codec) in &presets {
+                    let selected =
+                        *v == p && range.is_none_or(|r| r == current_range) && codec.is_none_or(|c| c == current_codec);
                     if ui.selectable_label(selected, name).clicked() {
                         p = *v;
                         if let Some(range) = range {
                             self.shared.set_video_range(*range);
+                        }
+                        if let Some(codec) = codec
+                            && *codec != current_codec
+                        {
+                            let _ = self.shared.set_video_codec(*codec);
                         }
                     }
                 }
@@ -1507,18 +1542,23 @@ impl Viewer {
                 if ui.button("Reset all").clicked() {
                     p = picture::Picture::default();
                     self.shared.set_video_range(VideoRange::Auto);
+                    if current_codec != VideoCodec::H264 {
+                        let _ = self.shared.set_video_codec(VideoCodec::H264);
+                    }
                 }
                 ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(120.0).hint_text("preset name"));
                 if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
-                    let mut all = settings::get("picture_presets")
-                        .filter(Value::is_object)
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    all[self.preset_name.trim()] = serde_json::json!({
-                        "picture": p.to_json(),
-                        "video_range": video_range_name(*self.shared.video_range.lock().unwrap()),
-                    });
-                    settings::set("picture_presets", all);
+                    Self::save_preset(
+                        self.preset_name.trim(),
+                        p,
+                        *self.shared.video_range.lock().unwrap(),
+                        *self.shared.video_codec.lock().unwrap(),
+                    );
                     self.preset_name.clear();
+                }
+                let can_delete = current != "Original" && current != "Custom";
+                if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+                    Self::delete_preset(&current);
                 }
             });
         });
@@ -1804,6 +1844,24 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
             sh.set_video_range(range);
         }
         return Ok(Reply::Text(format!("ok {}", video_range_name(*sh.video_range.lock().unwrap()))));
+    } else if let Some(name) = m["picture_save"].as_str() {
+        let name = name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("Original") {
+            bail!("picture_save needs a name other than Original");
+        }
+        Viewer::save_preset(
+            name,
+            *sh.picture.lock().unwrap(),
+            *sh.video_range.lock().unwrap(),
+            *sh.video_codec.lock().unwrap(),
+        );
+        return Ok(Reply::Text(format!("ok saved {name}")));
+    } else if let Some(name) = m["picture_delete"].as_str() {
+        let name = name.trim();
+        if !Viewer::delete_preset(name) {
+            bail!("no saved picture preset named '{name}'");
+        }
+        return Ok(Reply::Text(format!("ok deleted {name}")));
     } else if let Some(v) = m.get("picture") {
         // {"picture": {"shadows": 0.5, ...}} changes those values; {"picture": "preset name"} loads a preset;
         // {"picture": ""} only reports. Reply: ok {current values}
@@ -1811,15 +1869,17 @@ async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         let next = match v {
             Value::Object(_) => Some((cur.merged(v), None)),
             Value::String(name) if !name.is_empty() => {
-                let builtin = picture::builtin()
+                let preset = Viewer::picture_presets()
                     .into_iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                    .map(|(_, p)| (p, Some(VideoRange::Auto)));
-                let saved = Viewer::saved_presets()
-                    .into_iter()
-                    .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
-                    .map(|(_, p, range)| (p, range));
-                Some(builtin.or(saved).ok_or_else(|| anyhow!("no picture preset named '{name}'"))?)
+                    .find(|(n, _, _, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, p, range, codec)| (p, range, codec));
+                let (picture, range, codec) = preset.ok_or_else(|| anyhow!("no picture preset named '{name}'"))?;
+                if let Some(codec) = codec
+                    && codec != *sh.video_codec.lock().unwrap()
+                {
+                    sh.set_video_codec(codec).map_err(|e| anyhow!(e))?;
+                }
+                Some((picture, range))
             }
             _ => None,
         };
@@ -1986,6 +2046,16 @@ mod tests {
         let (at, _) = parse_start_time("03:15").unwrap();
         assert!(at.duration_since(SystemTime::now()).unwrap() <= Duration::from_secs(24 * 3600));
         assert!(parse_start_time("3pm").is_err());
+    }
+
+    #[test]
+    fn only_original_is_built_in_and_game_profiles_are_user_settings() {
+        let presets = Viewer::builtin_presets();
+        assert_eq!(presets.len(), 1);
+        let (name, picture, range, codec) = &presets[0];
+        assert_eq!(name, "Original");
+        assert!(picture.is_neutral());
+        assert_eq!((*range, *codec), (Some(VideoRange::Auto), Some(VideoCodec::H264)));
     }
 
     #[test]

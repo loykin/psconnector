@@ -31,11 +31,6 @@ impl Default for Picture {
     }
 }
 
-/// Built-in presets: (name, values)
-pub fn builtin() -> Vec<(&'static str, Picture)> {
-    vec![("Original", Picture::default())]
-}
-
 impl Picture {
     pub fn is_neutral(&self) -> bool {
         *self == Self::default()

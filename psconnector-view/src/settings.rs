@@ -34,6 +34,21 @@ pub fn set(key: &str, value: Value) {
     }
 }
 
+/// Removes one legacy or no-longer-global setting, keeping all other keys.
+pub fn remove(key: &str) {
+    let mut value = read();
+    if !value.as_object_mut().is_some_and(|object| object.remove(key).is_some()) {
+        return;
+    }
+    let path = path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, format!("{value:#}\n")) {
+        log::warn!("cannot save {}: {e}", path.display());
+    }
+}
+
 /// Address of the console connected to last time.
 pub fn last_host() -> Option<String> {
     get("host").and_then(|v| v.as_str().map(str::to_string))
