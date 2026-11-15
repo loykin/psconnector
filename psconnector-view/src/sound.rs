@@ -1,10 +1,10 @@
 //! Plays the console's audio on this computer's default output device.
 //!
 //! A feeder thread converts the decoded chunks to the device format and fills a small buffer; the device
-//! callback drains it. Audio arrives in bursts (it shares the network with large video frames), so the
-//! buffer aims at about 120 ms: when it holds more, playback runs 2 % faster until it is back; when it holds
-//! less, 2 % slower. Only if it runs dry does the device play silence, and only far beyond the target is
-//! old audio dropped.
+//! callback drains it. How much to keep buffered adapts to the network: it starts at 120 ms, comes down
+//! (to 30 ms) while the buffer never gets close to empty, and goes up by 40 ms whenever it runs dry. Around
+//! that target, playback runs 2 % faster or slower to steer the buffer (inaudible), so audio is never cut.
+//! Only if it runs dry does the device play silence, and only far beyond the target is old audio dropped.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,14 +15,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use psconnector::Audio;
 
-/// Start playing once this much is buffered (and again after running dry)
-const START_MS: usize = 80;
-/// Buffer size to steer towards
-const TARGET_MS: usize = 120;
-/// Above this, play slightly faster; below LOW_MS, slightly slower
-const HIGH_MS: usize = 180;
-const LOW_MS: usize = 60;
-/// Drop the oldest audio beyond this much buffered (down to TARGET_MS)
+/// Buffer target at the start, and its limits
+const INITIAL_TARGET_MS: usize = 120;
+const MIN_TARGET_MS: usize = 30;
+const MAX_TARGET_MS: usize = 200;
+/// After running dry, the target goes up by this much
+const GROW_MS: usize = 40;
+/// The target comes down at most this much per window, keeping this much in hand at the lowest point
+const SHRINK_STEP_MS: usize = 10;
+const KEEP_MS: usize = 15;
+/// How long the buffer must stay comfortably full before the target comes down
+const ADAPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+/// Drop the oldest audio beyond this much buffered (down to the target)
 const MAX_MS: usize = 350;
 /// If decoded PCM has backed up this far before conversion, discard old chunks down to the target. A chunk
 /// is normally 10 ms. This is deliberately above normal network bursts (observed around 130 ms).
@@ -33,7 +37,15 @@ const NUDGE: f64 = 0.02;
 
 struct Buffer {
     samples: VecDeque<f32>,
-    /// Waiting for START_MS before playing (at start and after running dry)
+    /// Current buffer target (adapts, see the module docs)
+    target_ms: usize,
+    /// Lowest level while playing in the current adaptation window, and when that window began
+    window_min: usize,
+    window_start: std::time::Instant,
+    /// Sum and count of buffer levels seen by the device callback (average latency for the report)
+    level_sum: u64,
+    level_n: u64,
+    /// Waiting for three quarters of the target before playing (at start and after running dry)
     priming: bool,
     /// Times it ran dry (audible gaps) and times old audio was dropped, since the last report
     gaps: u32,
@@ -119,6 +131,11 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
     let per_ms = rate as usize * channels / 1000;
     let buf = Arc::new(Mutex::new(Buffer {
         samples: VecDeque::new(),
+        target_ms: INITIAL_TARGET_MS,
+        window_min: usize::MAX,
+        window_start: std::time::Instant::now(),
+        level_sum: 0,
+        level_n: 0,
         priming: true,
         gaps: 0,
         trims: 0,
@@ -183,13 +200,15 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
                 for chunk in chunks {
                     // Read only the steering state while locked. Resampling and temporary allocation must not
                     // make the real-time device callback wait for this mutex.
-                    let (held, priming) = {
-                        let b = buf.lock().unwrap();
-                        (b.samples.len() / per_ms, b.priming)
+                    let (held, priming, target) = {
+                        let mut b = buf.lock().unwrap();
+                        adapt(&mut b, per_ms);
+                        (b.samples.len() / per_ms, b.priming, b.target_ms)
                     };
-                    conv.speed = if held > HIGH_MS {
+                    let (high, low) = (target + target / 2, target.saturating_sub(target / 2).max(MIN_TARGET_MS / 2));
+                    conv.speed = if held > high {
                         1.0 + NUDGE
-                    } else if held < LOW_MS && !priming {
+                    } else if held < low && !priming {
                         1.0 - NUDGE
                     } else {
                         1.0
@@ -198,9 +217,9 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
                     let mut b = buf.lock().unwrap();
                     b.samples.append(&mut converted);
                     b.max_len = b.max_len.max(b.samples.len());
-                    let max = MAX_MS * per_ms;
+                    let max = MAX_MS.max(b.target_ms * 3) * per_ms;
                     if b.samples.len() > max {
-                        let extra = b.samples.len() - TARGET_MS * per_ms;
+                        let extra = b.samples.len() - b.target_ms * per_ms;
                         let extra = extra - extra % channels;
                         b.samples.drain(..extra);
                         b.trims += 1;
@@ -209,23 +228,47 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
                 let mut b = buf.lock().unwrap();
                 b.input_dropped = b.input_dropped.saturating_add(dropped as u32);
                 if report.elapsed() >= std::time::Duration::from_secs(10) {
-                    if b.gaps > 0 || b.trims > 0 || b.input_dropped > 0 {
-                        log::info!(
-                            "audio: {} gaps, {} output trims, {} input chunks dropped in 10 s, buffer {}..{} ms",
-                            b.gaps,
-                            b.trims,
-                            b.input_dropped,
-                            if b.min_len == usize::MAX { 0 } else { b.min_len / per_ms },
-                            b.max_len / per_ms
-                        );
-                    }
+                    let avg = b.level_sum.checked_div(b.level_n).unwrap_or(0) as usize / per_ms;
+                    log::info!(
+                        "audio: {} gaps, {} output trims, {} input chunks dropped in 10 s, buffer {}..{} ms (avg {} ms, target {} ms)",
+                        b.gaps,
+                        b.trims,
+                        b.input_dropped,
+                        if b.min_len == usize::MAX { 0 } else { b.min_len / per_ms },
+                        b.max_len / per_ms,
+                        avg,
+                        b.target_ms
+                    );
                     (b.gaps, b.trims, b.input_dropped, b.min_len, b.max_len) = (0, 0, 0, usize::MAX, 0);
+                    (b.level_sum, b.level_n) = (0, 0);
                     report = std::time::Instant::now();
                 }
             }
         })
         .ok();
     true
+}
+
+/// Diagnostics: PSCONNECTOR_AUDIO_FIXED=1 keeps the 120 ms target (the old behaviour) for comparison.
+fn fixed_target() -> bool {
+    static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIXED.get_or_init(|| std::env::var_os("PSCONNECTOR_AUDIO_FIXED").is_some())
+}
+
+/// Brings the target down while the buffer has stayed comfortably above empty for a whole window.
+fn adapt(b: &mut Buffer, per_ms: usize) {
+    if fixed_target() || b.priming || b.window_start.elapsed() < ADAPT_WINDOW {
+        return;
+    }
+    if b.window_min != usize::MAX {
+        let lowest_ms = b.window_min / per_ms;
+        if lowest_ms > KEEP_MS {
+            let down = (lowest_ms - KEEP_MS).min(SHRINK_STEP_MS);
+            b.target_ms = b.target_ms.saturating_sub(down).max(MIN_TARGET_MS);
+        }
+    }
+    b.window_min = usize::MAX;
+    b.window_start = std::time::Instant::now();
 }
 
 fn build<T>(
@@ -242,7 +285,8 @@ where
         *config,
         move |data: &mut [T], _| {
             let mut b = buf.lock().unwrap();
-            if b.priming && b.samples.len() >= START_MS * per_ms {
+            // start once three quarters of the target is in, so playback begins near the target
+            if b.priming && b.samples.len() >= (b.target_ms * 3 / 4).max(KEEP_MS) * per_ms {
                 b.priming = false;
             }
             let mute = muted.load(Ordering::Relaxed);
@@ -251,11 +295,21 @@ where
                 *slot = T::from_sample(if mute { 0.0 } else { v });
             }
             if !b.priming {
-                b.min_len = b.min_len.min(b.samples.len());
+                let len = b.samples.len();
+                b.min_len = b.min_len.min(len);
+                b.window_min = b.window_min.min(len);
+                b.level_sum += len as u64;
+                b.level_n += 1;
             }
             if !b.priming && b.samples.is_empty() {
                 b.priming = true;
                 b.gaps += 1;
+                // ran dry: the network needs more cushion
+                if !fixed_target() {
+                    b.target_ms = (b.target_ms + GROW_MS).min(MAX_TARGET_MS);
+                }
+                b.window_min = usize::MAX;
+                b.window_start = std::time::Instant::now();
             }
         },
         |e| log::warn!("audio output error: {e}"),
@@ -269,6 +323,43 @@ mod tests {
 
     fn chunk(rate: u32, samples: Vec<i16>) -> Audio {
         Audio { rate, channels: 2, samples }
+    }
+
+    fn buffer(target: usize) -> Buffer {
+        Buffer {
+            samples: VecDeque::new(),
+            target_ms: target,
+            window_min: usize::MAX,
+            window_start: std::time::Instant::now() - ADAPT_WINDOW,
+            level_sum: 0,
+            level_n: 0,
+            priming: false,
+            gaps: 0,
+            trims: 0,
+            min_len: usize::MAX,
+            max_len: 0,
+            input_dropped: 0,
+        }
+    }
+
+    #[test]
+    fn target_shrinks_with_spare_buffer_and_stops_near_the_floor() {
+        let per_ms = 96; // 48 kHz stereo
+        let mut b = buffer(120);
+        b.window_min = 90 * per_ms; // never below 90 ms in the last window
+        adapt(&mut b, per_ms);
+        assert_eq!(b.target_ms, 110, "comes down one step");
+        for _ in 0..20 {
+            b.window_min = 40 * per_ms;
+            b.window_start = std::time::Instant::now() - ADAPT_WINDOW;
+            adapt(&mut b, per_ms);
+        }
+        assert_eq!(b.target_ms, MIN_TARGET_MS, "floor");
+        // a window that came close to empty keeps the target
+        let mut b = buffer(80);
+        b.window_min = 10 * per_ms;
+        adapt(&mut b, per_ms);
+        assert_eq!(b.target_ms, 80);
     }
 
     #[test]

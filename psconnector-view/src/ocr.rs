@@ -16,7 +16,7 @@ pub fn crop_scale(f: &Frame, region: [u32; 4], scale: f32) -> (usize, usize, Vec
     let ow = ((w as f32 * scale).round() as usize).max(1);
     let oh = ((h as f32 * scale).round() as usize).max(1);
     let mut out = vec![0u8; ow * oh * 3];
-    let px = |sx: usize, sy: usize, c: usize| f.rgb[((y + sy) * f.width + x + sx) * 3 + c] as f32;
+    let px = |sx: usize, sy: usize, c: usize| f.rgb()[((y + sy) * f.width + x + sx) * 3 + c] as f32;
     for oy in 0..oh {
         let fy = ((oy as f32 + 0.5) / scale - 0.5).clamp(0.0, (h - 1) as f32);
         let (y0, ty) = (fy.floor() as usize, fy.fract());

@@ -44,8 +44,8 @@ pub use audio::Audio;
 pub use controller::Button;
 use std::sync::Arc;
 pub use stream::{Phase, StreamConfig};
-pub use video::Frame;
 pub use video::VideoRange;
+pub use video::{Frame, PixelFormat, hdr_sdr_curve};
 
 /// Video stream requested from the PS5.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

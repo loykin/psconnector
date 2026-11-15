@@ -1,5 +1,6 @@
 [workspace]
 members = ["psconnector", "psconnector-view", "psconnector-mcp"]
+exclude = ["third_party"]
 resolver = "2"
 
 [workspace.package]
@@ -17,3 +18,7 @@ log = "0.4"
 png = "0.18.1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+
+# Faster CELT transform; see third_party/opus-decoder/PSCONNECTOR_PATCH.md
+[patch.crates-io]
+opus-decoder = { path = "third_party/opus-decoder" }

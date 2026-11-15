@@ -79,7 +79,50 @@ struct AudioState {
     max_gap: Duration,
 }
 
+/// Share of video units to drop on purpose (`PSCONNECTOR_DROP_VIDEO`), for testing loss recovery.
+fn drop_rate() -> Option<f64> {
+    static RATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let r = std::env::var("PSCONNECTOR_DROP_VIDEO").ok()?.parse::<f64>().ok().filter(|r| *r > 0.0)?;
+        warn!("dropping {:.1} % of video units on purpose (PSCONNECTOR_DROP_VIDEO)", r * 100.0);
+        Some(r)
+    })
+}
+
+/// Diagnostics: PSCONNECTOR_DUMP_VIDEO=file writes the first 4000 decrypted video units (all of them,
+/// FEC units included) as lines "frame unit src total hex", to check loss recovery against real data.
+fn dump_unit(p: &video::VideoPacket, data: &[u8]) {
+    use std::io::Write;
+    static DUMP: std::sync::OnceLock<Option<std::sync::Mutex<(std::fs::File, u32)>>> = std::sync::OnceLock::new();
+    let Some(dump) = DUMP.get_or_init(|| {
+        let path = std::env::var("PSCONNECTOR_DUMP_VIDEO").ok()?;
+        std::fs::File::create(path).ok().map(|f| std::sync::Mutex::new((f, 0)))
+    }) else {
+        return;
+    };
+    let mut d = dump.lock().unwrap();
+    if d.1 >= 4000 {
+        return;
+    }
+    d.1 += 1;
+    let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = writeln!(d.0, "{} {} {} {} {hex}", p.frame, p.unit, p.src_units(), p.total);
+}
+
+/// Small deterministic generator for the drop test.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 struct VideoState {
+    rng: XorShift,
     tx: VideoTx,
     /// Set by the decoder when it needs a key frame to recover
     need_key: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -250,6 +293,38 @@ impl Stream {
         self.send(&pkt).await;
     }
 
+    /// Tells the console the session is over and waits (briefly) until it confirms. A Disconnect that
+    /// goes missing leaves the console holding the session, and the next connection is refused with
+    /// "another Remote Play session is connected" until the console times it out, which took minutes.
+    async fn disconnect(&mut self, buf: &mut [u8]) {
+        const TRIES: u32 = 5;
+        const WAIT: Duration = Duration::from_millis(200);
+        let data = proto::disconnect();
+        if self.cipher.is_some() {
+            self.tsn += 1;
+        }
+        let tsn = self.tsn;
+        let started = Instant::now();
+        for attempt in 1..=TRIES {
+            // the same chunk (same TSN) each time: a repeat is a duplicate to the console, not a new message
+            let payload = takion::data_payload(tsn, 1, &data);
+            let pkt = takion::control(chunk::DATA, 1, self.tag_remote, &payload, self.cipher.as_mut(), 0);
+            self.send(&pkt).await;
+            let deadline = Instant::now() + WAIT;
+            while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, self.sock.recv(buf)).await {
+                let Some(ctl) = takion::parse_control(&buf[..n]) else { continue };
+                if ctl.chunk_type == chunk::DATA_ACK && ctl.payload.get(..4) == Some(&tsn.to_be_bytes()[..]) {
+                    log::info!(
+                        "console confirmed the disconnect after {} ms (attempt {attempt})",
+                        started.elapsed().as_millis()
+                    );
+                    return;
+                }
+            }
+        }
+        warn!("console did not confirm the disconnect ({TRIES} tries); the next connection may wait for it");
+    }
+
     async fn send_state(&mut self) {
         let Some(c) = self.cipher.as_mut() else { return };
         let pkt = takion::feedback(header::FEEDBACK_STATE, self.state_seq, &self.sticks.state_data(), c);
@@ -380,10 +455,17 @@ impl Stream {
         let (Some(c), Some(v)) = (self.cipher.as_ref(), self.video.as_mut()) else { return };
         let Some(asm) = v.assembler.as_mut() else { return };
         let Some(p) = video::parse(pkt) else { return };
+        // diagnostics: PSCONNECTOR_DROP_VIDEO=0.02 drops that share of video units to exercise FEC recovery
+        if let Some(rate) = drop_rate()
+            && v.rng.next() < rate
+        {
+            return;
+        }
         let mut data = p.data.to_vec();
         c.remote.xor(p.key_pos, &mut data);
+        dump_unit(&p, &data);
         let mut out = Vec::new();
-        asm.push(p.frame, p.unit, p.src_units(), data, &mut out);
+        asm.push(p.frame, p.unit, p.src_units(), p.total, data, &mut out);
         let mut lost = None;
         for a in out {
             match a {
@@ -434,7 +516,13 @@ pub async fn run(
         sticks: Sticks::default(),
         av_received: 0,
         phase,
-        video: out.video.map(|(tx, need_key)| VideoState { tx, need_key, assembler: None, last_corrupt: None }),
+        video: out.video.map(|(tx, need_key)| VideoState {
+            rng: XorShift(0x9E37_79B9_7F4A_7C15),
+            tx,
+            need_key,
+            assembler: None,
+            last_corrupt: None,
+        }),
         audio: out.audio.map(|tx| AudioState {
             tx,
             reorder: Reorder::default(),
@@ -578,7 +666,7 @@ pub async fn run(
                 }
                 Some(Cmd::Stop) | None => {
                     if s.cipher.is_some() {
-                        s.send_data(&proto::disconnect(), 1, false).await;
+                        s.disconnect(&mut buf).await;
                     }
                     let _ = s.phase.send(Phase::Closed("closed by the client".into()));
                     return Ok(());

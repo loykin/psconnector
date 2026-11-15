@@ -176,10 +176,19 @@ pub async fn start(host: &str, reg: &Registration, video_codec: VideoCodec) -> R
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     let launch_cipher = SessionCipher::new(key, rp_nonce);
     let ctrl_task = tokio::spawn(ctrl_loop(sock, resp.rest, cipher, id_tx, ctrl_rx));
-    let session_id = tokio::time::timeout(Duration::from_secs(5), id_rx)
-        .await
-        .map_err(|_| Error::Timeout("session id"))?
-        .map_err(|_| Error::Closed("control channel closed before the session id arrived".into()))?;
+    // a console that has just woken up can take several seconds here
+    let session_id = match tokio::time::timeout(Duration::from_secs(10), id_rx).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(_)) => {
+            ctrl_task.abort();
+            return Err(Error::Closed("control channel closed before the session id arrived".into()));
+        }
+        Err(_) => {
+            // close the half-open control connection, or the console keeps treating this as an active session
+            ctrl_task.abort();
+            return Err(Error::Timeout("session id"));
+        }
+    };
     Ok(Started { session_id, launch_cipher, ctrl: ctrl_tx, ctrl_task })
 }
 

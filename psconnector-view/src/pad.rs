@@ -13,8 +13,37 @@ use psconnector::{Button, Client};
 const DEAD_ZONE: f32 = 0.08;
 /// Smallest stick change worth sending.
 const STEP: f32 = 0.01;
-/// How often to check the pad for new input. `Gilrs::next_event_blocking` can stall on macOS, so poll.
-const POLL: Duration = Duration::from_millis(4);
+/// How often the time from the pad's report to sending it is logged (only when there was input)
+const REPORT_EVERY: Duration = Duration::from_secs(10);
+
+/// Time from the OS reporting a pad event to it being handed to the stream, in microseconds.
+#[derive(Default)]
+struct Delay {
+    samples: Vec<u64>,
+    since: Option<std::time::Instant>,
+}
+
+impl Delay {
+    fn add(&mut self, at: std::time::SystemTime) {
+        if let Ok(d) = std::time::SystemTime::now().duration_since(at) {
+            self.samples.push(d.as_micros() as u64);
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= REPORT_EVERY && !self.samples.is_empty() {
+            self.samples.sort_unstable();
+            let n = self.samples.len();
+            let pct = |p: usize| self.samples[(n * p / 100).min(n - 1)] as f64 / 1000.0;
+            log::info!(
+                "pad: {n} events in 10 s, report-to-send p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+                pct(50),
+                pct(99),
+                *self.samples.last().unwrap() as f64 / 1000.0
+            );
+            self.samples.clear();
+            self.since = Some(std::time::Instant::now());
+        }
+    }
+}
 
 fn map(b: Pad) -> Option<Button> {
     Some(match b {
@@ -99,11 +128,16 @@ pub fn spawn(client: impl Fn() -> Option<Arc<Client>> + Send + 'static, name: Ar
             *name.lock().unwrap() = first;
         };
         let mut sticks = Sticks::default();
+        let mut delay = Delay::default();
         loop {
-            let Some(ev) = gilrs.next_event() else {
-                std::thread::sleep(POLL);
-                continue;
-            };
+            // wakes as soon as the OS reports input; nothing else runs on this thread, so no timeout
+            let Some(ev) = gilrs.next_event_blocking(None) else { continue };
+            if matches!(
+                ev.event,
+                EventType::ButtonPressed(..) | EventType::ButtonReleased(..) | EventType::AxisChanged(..)
+            ) {
+                delay.add(ev.time);
+            }
             match ev.event {
                 EventType::ButtonPressed(b, _) => {
                     if let (Some(b), Some(c)) = (map(b), client()) {

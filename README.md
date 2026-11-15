@@ -26,8 +26,8 @@ It is a connection layer that lets game macros and AI assistants operate a PS5.
 | Stick input (state re-sent every 200 ms) | done (verified with analog recording playback in Code Vein) |
 | Rest mode | done |
 | Local game controller (DualSense, ...) in psconnector-view | done (gilrs) |
-| Video (H.264/H.265, 360p / 720p / 1080p) | done (60 fps at 1080p on the tested Apple Silicon Mac; H.264 uses openh264, H.265 uses VideoToolbox). Frames with missing units are dropped and a key frame is requested. No FEC recovery yet |
-| Audio (Opus → PCM) | done (pure-Rust Opus decoder; lost packets are filled from the copies in the next ones, then by concealment) |
+| Video (H.264/H.265, 360p / 720p / 1080p) | done (60 fps at 1080p on the tested Apple Silicon Mac). On macOS both codecs use VideoToolbox (hardware) and the decoded pictures go to the screen without a copy (Metal); openh264 (software) is used elsewhere. Lost units are rebuilt from the FEC units the console sends with every frame; only when that is not enough is a key frame requested |
+| Audio (Opus → PCM) | done (pure-Rust Opus decoder, with a faster transform patched in under `third_party/opus-decoder`; lost packets are filled from the copies in the next ones, then by concealment) |
 | Finding consoles on the network | done (DDP broadcast) |
 | PSN login, PIN registration | done, in the psconnector-view start screen (earlier pyremoteplay registrations are still read) |
 
@@ -48,7 +48,7 @@ Internal modules:
 | `takion` | Building and parsing Takion packets |
 | `gkcrypt` | Stream-stage encryption (ECDH, key stream, GMAC) |
 | `controller` | Button events and stick state data |
-| `video` | Video unit assembly, decoder thread (openh264) |
+| `video` | Video unit assembly with FEC recovery (`video/fec.rs`), decoders: VideoToolbox H.264/H.265 on macOS, openh264 |
 | `audio` | Audio packets, frame order and loss recovery, Opus decoder thread |
 | `proto` | Takion protobuf messages |
 | `profile` | Registration data (`~/.psconnector/profile.json`; also reads pyremoteplay's `~/.pyremoteplay/.profile.json`) |
@@ -110,7 +110,7 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"input_bench":{}}` / `{"input_bench":{"seconds":12,"interval_ms":10,"burst":4}}` generate below-dead-zone input for latency statistics | `ok input benchmark started ...` |
 | `{"picture_snap":"/tmp/shown.png"}` save the current frame with the window's picture adjustment applied | `ok` |
 | `{"video_codec":"h264|h265|h265-hdr"}` reconnect with another stream codec (`""` only reports) | `ok reconnecting h265-hdr` |
-| `{"video_range":"auto|limited|full"}` override incorrect H.264 range metadata (`""` only reports) | `ok full` |
+| `{"video_range":"auto|limited|full"}` override incorrect H.264 range metadata, applied on the GPU so decoding stays in hardware (`""` only reports) | `ok full` |
 | `{"picture":{"shadows":0.5,"highlights":0.7}}` / `{"picture":"saved preset name"}` picture adjustment (`""` only reports) | `ok {values}` |
 | `{"picture_save":"game name"}` / `{"picture_delete":"game name"}` save or delete the current range and picture controls as one game preset | `ok saved game name` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
@@ -129,26 +129,36 @@ The resolution is agreed when connecting, so changing it in the bar reconnects. 
 
 On macOS, **Picture → Stream codec** can request H.264 SDR, hardware-decoded H.265 SDR, or H.265 HDR. The HDR stream is converted to the SDR window with a highlight-preserving display curve; this keeps the HDR source's highlight detail but is not native HDR monitor output. H.265 decoding is currently macOS-only.
 
-**Picture** in the bar opens controls for the window: brightness, shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved and deleted by name. Every new session starts as **Original** (H.264 SDR with no picture adjustment), so one game's correction never leaks into another game. Selecting **Original** later removes the display adjustment instantly. Stream codec is deliberately separate because changing H.264/H.265 requires a full Remote Play reconnect; changing a picture preset never reconnects. Choose the source range, adjust the sliders, type the game name and press **Save**. That preset stores the range and seven picture controls; select it only while playing that game. Add another preset later if a different game needs one. Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back.
+**Picture** in the bar opens controls for the window: brightness, shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved and deleted by name. Every new session starts as **Original** (H.264 SDR with no picture adjustment), so one game's correction never leaks into another game. Selecting **Original** later removes the display adjustment instantly. Stream codec is deliberately separate because changing H.264/H.265 requires a full Remote Play reconnect; changing a picture preset never reconnects. Choose the source range, adjust the sliders, type the game name and press **Save**. That preset stores the range and seven picture controls; select it only while playing that game. Add another preset later if a different game needs one. Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back. When a preset lifts dark tones, the window first smooths the compression blocks that hide there (a deband pass like mpv's, only on dark, nearly flat areas), so lifted shadows do not turn blotchy; H.265 leaves fewer such blocks than H.264.
 
 With the wgpu renderer, the seven picture controls run in a GPU shader; the CPU implementation remains as a fallback and for `picture_snap`. Both use the same integer lookup table so a saved preset keeps the same result when the render path changes. These controls provide live per-game correction, but a preset is not a reference-grade match to another game's colour grading unless it has been calibrated against suitable reference images or a LUT.
 
 ### Video performance
 
-The viewer logs decode, colour conversion, queue delay and display-upload timing every 10 seconds. A measured 1080p60 H.264 session on the development Apple Silicon Mac, using a non-neutral picture preset, produced the following release-build results:
+The viewer logs decode, queue delay and display timing every 10 seconds. On macOS a decoded frame stays in VideoToolbox's IOSurface-backed pixel buffer (H.264 as YUV 4:2:0 in the stream's own range, H.265 as BGRA); the window wraps it as Metal textures (`CVMetalTextureCache`) and the shader does YUV → RGB with the chosen range and matrix, the HDR → SDR curve, dark-area deband and the picture adjustment once per stream pixel, and a second pass scales the result to the window, so a frame never passes through the CPU. Elsewhere, openh264's RGB is uploaded as it is. RGB for macros, OCR and screenshots is made only when they ask for it (`Frame::rgb()`).
 
-| Stage | Before GPU picture shader | Current |
+Measured on the development Apple Silicon Mac, 1080p60, release build, PS5 home screen (CPU is the viewer process, 100 % = one core):
+
+| | Before | Now |
 |---|---:|---:|
-| H.264 software decode | 2.2–2.8 ms/frame | 2.2–2.8 ms/frame |
-| YUV → RGB | 1.3–1.5 ms/frame | 1.3–1.5 ms/frame |
-| Picture adjustment + texture upload CPU time | 1.8–1.9 ms/frame | 1.05–1.18 ms/frame |
-| Display rate | 59–60 fps | 59–60 fps |
+| H.264: decoder / CPU | openh264, ~105–110 % | VideoToolbox, zero-copy, **~22–27 %** |
+| H.264 with the colour range picked by hand | openh264, ~105 % | unchanged: still hardware (31 % vs 32 % on auto, same run) |
+| H.265 SDR: CPU | ~40 % (0.9 ms/frame conversion) | **~32 %** (zero-copy) |
+| H.265 HDR: CPU (HDR → SDR mapping) | ~125 % (2.7 ms/frame) | **~33 %** (zero-copy, on the GPU) |
+| Copying decoded frames (A/B, same session conditions, H.264) | ~41 % CPU, 3.1 ms/frame | **~33 %**, 1.3 ms/frame |
+| Audio decoding (Opus, stereo 48 kHz) | ~8–10 % of a core | **~1.3 %** (audio on 24.4 % vs `--no-audio` 23.0 %) |
+| Display rate | 60 fps | 60 fps |
+| 0.5 % of video units lost (test) | 0.3 fps, 142 key frame requests in 40 s | **60 fps, 0 key frame requests** (FEC) |
+| Pad report → sent to the console | ~2 ms average (4 ms polling) | **~0.01 ms** (event driven) |
+| Audio buffer (sound behind picture) | ~86 ms average (fixed target) | **~35 ms** average (adaptive, no gaps) |
 
-These are implementation measurements, not input-to-photon latency. They vary with the Mac, scene, codec and background load. The source is 60 fps, so the optimization primarily reduces CPU work and frame-time spikes rather than increasing the frame-rate ceiling.
+These are implementation measurements, not input-to-photon latency; they vary with the Mac, scene and network (the PS5 home screen alone moves CPU by 5–10 points between runs, so the A/B rows were measured back to back).
 
-The current GPU path still uploads a CPU RGB buffer. The remaining macOS optimization is to pass VideoToolbox `CVPixelBuffer`/`IOSurface` output through `CVMetalTextureCache` and perform colour conversion, HDR tone mapping and picture adjustment on Metal without the intermediate CPU copy. H.264 also needs a VideoToolbox decoder path before it can use that complete zero-copy route.
+Diagnostics (environment variables): `PSCONNECTOR_H264=software` forces openh264; `PSCONNECTOR_DROP_VIDEO=0.005` drops that share of video units on purpose and `PSCONNECTOR_NO_FEC=1` ignores FEC units, to test loss recovery; `PSCONNECTOR_DUMP_VIDEO=file` writes 4000 decrypted video units for the offline FEC check (`PSCONNECTOR_FEC_DUMP=file cargo test -p psconnector --release real_capture -- --ignored`); `PSCONNECTOR_AUDIO_FIXED=1` keeps the old fixed audio buffer.
 
-The PS5's sound plays on the computer's default output device, about 0.1 s behind the picture: at 1080p audio packets can arrive up to ~130 ms apart, so a ~120 ms buffer absorbs that, and playback speed is nudged by 2 % to keep the buffer there instead of skipping. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
+If the Metal texture cache is unavailable, a frame is converted to RGB on the CPU and uploaded instead (logged at start: `video frames: zero-copy ...` when it is in use).
+
+The PS5's sound plays on the computer's default output device. The buffer that absorbs uneven packet arrival adapts: it starts at 120 ms, comes down to as little as 30 ms while it never gets close to empty, and grows by 40 ms whenever it runs dry; playback speed is nudged by 2 % to stay on target instead of skipping. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
 
 Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed cleanly.
 

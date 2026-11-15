@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
             let file = std::io::BufWriter::new(std::fs::File::create(&out)?);
             let mut enc = png::Encoder::new(file, frame.width as u32, frame.height as u32);
             enc.set_color(png::ColorType::Rgb);
-            enc.write_header()?.write_image_data(&frame.rgb)?;
+            enc.write_header()?.write_image_data(frame.rgb())?;
             println!("saved: {out}");
             c.close().await;
         }
