@@ -3,7 +3,7 @@
 A PS5 Remote Play client written in Rust. It connects to a PS5 over Remote Play from macOS or Windows, receives the screen and sound, and sends button and stick input.
 It is a connection layer that lets game macros and AI assistants operate a PS5.
 
-![psconnector-view: the PS5 screen with the macro bar on top](docs/viewer.jpg)
+![psconnector-view: the PS5 screen with the toolbar on top (picture, macro run widget, status, quality, sound)](docs/viewer.jpg)
 
 > Unofficial tool, not affiliated with Sony Interactive Entertainment. PlayStation, PS5 and PS Remote Play are trademarks of Sony.
 
@@ -115,7 +115,7 @@ Without an address it opens the start screen (or reconnects to the console used 
 | `{"picture_save":"game name"}` / `{"picture_delete":"game name"}` save or delete the current range and picture controls as one game preset | `ok saved game name` |
 | `{"quality":"1080p"}` reconnect at `low` / `720p` / `1080p` (`""` only reports) | `ok {"quality", "width", "height", "reconnecting"}` |
 
-A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.
+A game controller connected to the computer (DualSense over USB or Bluetooth, Xbox pads, ...) drives the PS5 directly, like the official Remote Play app. Its name shows in the status at the right of the bar. Sticks are only sent when they move, so a pad lying on the desk does not fight a running macro. Start with `--no-pad` to turn this off.
 
 **Picture quality** is picked in the bar or with `--quality low|720p|1080p` (`--bitrate KBPS` to override the bit rate):
 
@@ -127,9 +127,9 @@ A game controller connected to the computer (DualSense over USB or Bluetooth, Xb
 
 The resolution is agreed when connecting, so changing it in the bar reconnects. The console usually releases the old session within a few seconds, but it can occasionally take more than a minute, so expect a wait without a picture. The choice is remembered in `~/.psconnector/settings.json`. Macros keep working across a change: OCR with `rel=` fractions and MCP screenshot regions (always in 1280x720 space) do not depend on the resolution.
 
-On macOS, **Picture → Stream codec** can request H.264 SDR, hardware-decoded H.265 SDR, or H.265 HDR. The HDR stream is converted to the SDR window with a highlight-preserving display curve; this keeps the HDR source's highlight detail but is not native HDR monitor output. H.265 decoding is currently macOS-only.
+On macOS, **Picture → Source → Codec** can request H.264 SDR, hardware-decoded H.265 SDR, or H.265 HDR. The HDR stream is converted to the SDR window with a highlight-preserving display curve; this keeps the HDR source's highlight detail but is not native HDR monitor output. H.265 decoding is currently macOS-only.
 
-**Picture** in the bar opens controls for the window: brightness, shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved and deleted by name. Every new session starts as **Original** (H.264 SDR with no picture adjustment), so one game's correction never leaks into another game. Selecting **Original** later removes the display adjustment instantly. Stream codec is deliberately separate because changing H.264/H.265 requires a full Remote Play reconnect; changing a picture preset never reconnects. Choose the source range, adjust the sliders, type the game name and press **Save**. That preset stores the range and seven picture controls; select it only while playing that game. Add another preset later if a different game needs one. Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back. When a preset lifts dark tones, the window first smooths the compression blocks that hide there (a deband pass like mpv's, only on dark, nearly flat areas), so lifted shadows do not turn blotchy; H.265 leaves fewer such blocks than H.264.
+**Picture** in the bar opens a panel beside the video: brightness, shadows (lift dark areas), highlights (pull bright areas down), contrast, saturation, warmth and shadow tint (takes a colour cast such as blue out of dark areas), with presets that can be saved and deleted by name. Every new session starts as **Original** (H.264 SDR with no picture adjustment), so one game's correction never leaks into another game. Selecting **Original** later removes the display adjustment instantly. Stream codec is deliberately separate because changing H.264/H.265 requires a full Remote Play reconnect; changing a picture preset never reconnects. Choose the source range, adjust the sliders, then **Save** and type the game name. That preset stores the range and seven picture controls; select it only while playing that game. Add another preset later if a different game needs one. Only what the window shows changes; macros, OCR and screenshots get the console's original frames. Detail the console already clipped to pure white or black cannot come back. When a preset lifts dark tones, the window first smooths the compression blocks that hide there (a deband pass like mpv's, only on dark, nearly flat areas), so lifted shadows do not turn blotchy; H.265 leaves fewer such blocks than H.264.
 
 With the wgpu renderer, the seven picture controls run in a GPU shader; the CPU implementation remains as a fallback and for `picture_snap`. Both use the same integer lookup table so a saved preset keeps the same result when the render path changes. These controls provide live per-game correction, but a preset is not a reference-grade match to another game's colour grading unless it has been calibrated against suitable reference images or a LUT.
 
@@ -158,15 +158,15 @@ Diagnostics (environment variables): `PSCONNECTOR_H264=software` forces openh264
 
 If the Metal texture cache is unavailable, a frame is converted to RGB on the CPU and uploaded instead (logged at start: `video frames: zero-copy ...` when it is in use).
 
-The PS5's sound plays on the computer's default output device. The buffer that absorbs uneven packet arrival adapts: it starts at 120 ms, comes down to as little as 30 ms while it never gets close to empty, and grows by 40 ms whenever it runs dry; playback speed is nudged by 2 % to stay on target instead of skipping. 🔊 in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
+The PS5's sound plays on the computer's default output device. The buffer that absorbs uneven packet arrival adapts: it starts at 120 ms, comes down to as little as 30 ms while it never gets close to empty, and grows by 40 ms whenever it runs dry; playback speed is nudged by 0.5 % (inaudible) to stay on target instead of skipping, with a windowed-sinc resampler so the treble stays intact. The speaker button in the bar mutes it; `--mute` starts muted and `--no-audio` does not decode it at all.
 
 Whether you quit with Q in the window, Ctrl+C, or SIGTERM, the session is closed cleanly.
 
 ### Macro bar
 
-Pick a macro in the bar at the top of the window and press **▶ Run / ■ Stop**.
+Pick a macro in the run widget at the top of the window and press **▶**; while it runs, the same widget shows its progress and **■** stops it.
 
-**Every folder with a `macro.json` in the `macros` folder next to `psconnector-view` is a macro.** To add one, put its folder there (or link a whole repository) and press **Reload list**. The release archives already have `macros/` beside the program, so the whole folder can be unzipped or moved anywhere, on Windows too. A development build (`target/release/`) reads the repository's `macros/` folder, where your own macros are ignored by git.
+**Every folder with a `macro.json` in the `macros` folder next to `psconnector-view` is a macro.** To add one, put its folder there (or link a whole repository) and choose **Reload macro list** in the bar's **⋯** menu. The release archives already have `macros/` beside the program, so the whole folder can be unzipped or moved anywhere, on Windows too. A development build (`target/release/`) reads the repository's `macros/` folder, where your own macros are ignored by git.
 
 ```bash
 ln -s ~/Project/codevein-macro macros/codevein
@@ -181,16 +181,16 @@ Only `cmd` is required. The macro runs in its own folder, so relative paths work
 - Macros run as child processes. The port is passed in the `PSCONNECTOR_PORT` environment variable.
 - Stop sends SIGINT first (KeyboardInterrupt in Python) and kills the process if it has not exited after 3 seconds.
 - However a macro ends, psconnector-view releases every button and centers both sticks, so nothing stays pressed.
-- The bar shows the run time and the last line of the macro's output, with Rest mode and Disconnect on the right.
+- The run widget shows the run time (and time left), with the last line of the macro's output next to it. Rest mode and Disconnect are in the **⋯** menu.
 - `--run NAME` starts a macro right away.
 
 #### Time limit, rest mode afterwards, start time
 
-Next to the macro picker:
+In the options button next to **▶** (the settings that change what **▶** does stay visible beside it):
 
 - **Limit** (`no limit` / `N min`, drag or type): how long to run. Defaults to `limit_min` from the list.
-- **then nothing / then rest mode**: what to do when the macro ends by itself or at its limit. Defaults to `after`. Pressing ■ Stop yourself never triggers it.
-- **HH:MM + ⏰ Schedule**: start later. `23:30` is today (or tomorrow if already past), `+90` is in 90 minutes. **Cancel schedule** or ■ Stop cancels it.
+- **When done: Nothing / Rest mode**: what to do when the macro ends by itself or at its limit. Defaults to `after`. Pressing ■ Stop yourself never triggers it.
+- **Start at HH:MM + Schedule**: start later. `23:30` is today (or tomorrow if already past), `+90` is in 90 minutes. While it waits, the run widget shows the start time and **Cancel**.
 
 When the limit is reached, a macro that checks `ps.should_stop()` gets 2 minutes to finish (for example the current lap) and exit; a macro that never checks it is stopped right away. The same options work from the command line and the command port:
 
@@ -275,9 +275,9 @@ Nothing else to install. Start `psconnector-view` without an address and its sta
 1. **Find**: consoles on the network are listed (on or in rest mode). An address can also be typed in.
 2. **Sign in to PSN** (once): Sony's sign-in page opens in a small window inside the app (the system web view: WebKit on macOS, WebView2 on Windows), in a private session that keeps nothing on disk. The password goes only to Sony; when Sony hands back the sign-in code, the window closes by itself. With **use the browser**, the page opens in your web browser instead and you paste the address you land on (`https://remoteplay.dl.playstation.net/remoteplay/redirect?code=...`) back into the app.
 3. **Pair** (once per console): on the PS5, Settings → System → Remote Play → Pair Device shows an 8-digit PIN; type it in.
-4. **Wake** a console in rest mode, or **Connect** to one that is on.
+4. **Connect**: a console in rest mode is woken first, then connected.
 
-**Disconnect** (or **Rest mode**) in the bar goes back to the start screen. There, **Sign out** removes the account and its pairings from this computer, and **Forget** removes one console's pairing (each asks once more first). The PS5 keeps this computer in Settings → System → Remote Play → Paired Devices until it is removed there.
+**Disconnect** (or **Rest mode**) in the bar's **⋯** menu goes back to the start screen. There, **Sign out** (at the bottom) removes the account and its pairings from this computer, and **Forget this PS5** (in a console's **⋯** menu) removes its pairing (each asks once more first). The PS5 keeps this computer in Settings → System → Remote Play → Paired Devices until it is removed there.
 
 The pairing is saved in `~/.psconnector/profile.json` (readable only by you; it holds the keys to the console), and the last console in `~/.psconnector/settings.json`, so the next start connects straight away. A registration made earlier with pyremoteplay is used as well.
 

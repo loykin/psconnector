@@ -3,7 +3,8 @@
 //! A feeder thread converts the decoded chunks to the device format and fills a small buffer; the device
 //! callback drains it. How much to keep buffered adapts to the network: it starts at 120 ms, comes down
 //! (to 30 ms) while the buffer never gets close to empty, and goes up by 40 ms whenever it runs dry. Around
-//! that target, playback runs 2 % faster or slower to steer the buffer (inaudible), so audio is never cut.
+//! that target, playback runs 0.5 % faster or slower to steer the buffer (a pitch change of under a tenth of a
+//! semitone, not audible), so audio is never cut.
 //! Only if it runs dry does the device play silence, and only far beyond the target is old audio dropped.
 
 use std::collections::VecDeque;
@@ -33,7 +34,7 @@ const MAX_MS: usize = 350;
 const MAX_INPUT_CHUNKS: usize = 35;
 const TARGET_INPUT_CHUNKS: usize = 12;
 /// Playback speed change used to steer the buffer
-const NUDGE: f64 = 0.02;
+const NUDGE: f64 = 0.005;
 
 struct Buffer {
     samples: VecDeque<f32>,
@@ -55,49 +56,150 @@ struct Buffer {
     max_len: usize,
 }
 
-/// Converts 16-bit interleaved chunks at any rate to f32 at the device rate and channel count
-/// (linear interpolation; extra device channels get silence, a mono device gets the average).
+/// Taps on each side of the interpolation point (32 in all)
+const HALF_TAPS: usize = 16;
+/// Fractional positions the filter is tabulated at (linear between neighbours)
+const PHASES: usize = 256;
+
+/// A windowed-sinc (Kaiser) low-pass, tabulated at `PHASES + 1` fractional offsets. `cutoff` is relative
+/// to the input's Nyquist frequency.
+struct Kernel {
+    cutoff: f64,
+    /// `(PHASES + 1) × 2·HALF_TAPS` weights; row p is for a fraction of p / PHASES, tap j for input
+    /// frame `i - HALF_TAPS + 1 + j`
+    rows: Vec<f32>,
+}
+
+impl Kernel {
+    fn new(cutoff: f64) -> Self {
+        const BETA: f64 = 8.0;
+        let bessel_i0 = |x: f64| {
+            let (mut sum, mut term) = (1.0, 1.0);
+            for k in 1..32 {
+                term *= (x / 2.0 / k as f64).powi(2);
+                sum += term;
+            }
+            sum
+        };
+        let taps = 2 * HALF_TAPS;
+        let mut rows = Vec::with_capacity((PHASES + 1) * taps);
+        for p in 0..=PHASES {
+            let frac = p as f64 / PHASES as f64;
+            let row: Vec<f64> = (0..taps)
+                .map(|j| {
+                    let x = j as f64 - (HALF_TAPS - 1) as f64 - frac;
+                    let sinc = if x.abs() < 1e-12 {
+                        cutoff
+                    } else {
+                        (std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x)
+                    };
+                    let w = (x / HALF_TAPS as f64).clamp(-1.0, 1.0);
+                    sinc * bessel_i0(BETA * (1.0 - w * w).sqrt()) / bessel_i0(BETA)
+                })
+                .collect();
+            // unity gain at DC, so a constant stays constant
+            let sum: f64 = row.iter().sum();
+            rows.extend(row.iter().map(|v| (v / sum) as f32));
+        }
+        Self { cutoff, rows }
+    }
+
+    /// Weights for a fractional position, interpolated between the two nearest tabulated rows.
+    fn weights(&self, frac: f64, out: &mut [f32; 2 * HALF_TAPS]) {
+        let at = frac * PHASES as f64;
+        let p = (at.floor() as usize).min(PHASES - 1);
+        let t = (at - p as f64) as f32;
+        let taps = 2 * HALF_TAPS;
+        let (a, b) = (&self.rows[p * taps..(p + 1) * taps], &self.rows[(p + 1) * taps..(p + 2) * taps]);
+        for j in 0..taps {
+            out[j] = a[j] + (b[j] - a[j]) * t;
+        }
+    }
+}
+
+/// Converts 16-bit interleaved chunks at any rate (and playback speed) to f32 at the device rate and
+/// channel count. Extra device channels get silence, a mono device gets the average.
+///
+/// Positions between input samples are interpolated with a 32-tap windowed sinc, which keeps the treble
+/// (linear interpolation dulls it: −5 dB at 16 kHz halfway between samples). At the same rate and normal
+/// speed on a whole-sample position, samples pass through untouched.
 struct Converter {
     out_rate: u32,
     out_channels: usize,
-    /// Position in the input, in input frames, carried across chunks
+    /// Position in `hist`, in input frames
     pos: f64,
     /// Playback speed (1 = normal)
     speed: f64,
-    prev: Vec<f32>,
+    /// Recent input frames, interleaved: what the filter still needs plus everything not played yet
+    hist: Vec<f32>,
+    channels: usize,
+    kernel: Option<Kernel>,
 }
 
 impl Converter {
+    fn new(out_rate: u32, out_channels: usize) -> Self {
+        Self { out_rate, out_channels, pos: 0.0, speed: 1.0, hist: Vec::new(), channels: 0, kernel: None }
+    }
+
+    /// Starts over (after old audio was thrown away): nothing is interpolated across the cut.
+    fn reset(&mut self) {
+        self.pos = 0.0;
+        self.hist.clear();
+    }
+
     fn push(&mut self, a: &Audio, out: &mut VecDeque<f32>) {
         let ch = usize::from(a.channels.max(1));
-        let frames: Vec<&[i16]> = a.samples.chunks_exact(ch).collect();
-        if frames.is_empty() {
+        if a.samples.len() < ch {
             return;
         }
-        if self.prev.len() != ch {
-            self.prev = vec![0.0; ch];
+        if ch != self.channels {
+            self.channels = ch;
+            self.reset();
         }
-        let step = f64::from(a.rate) / f64::from(self.out_rate) * self.speed;
-        let sample = |i: isize, c: usize| -> f32 {
-            if i < 0 { self.prev[c] } else { f32::from(frames[i as usize][c]) / 32768.0 }
-        };
-        // pos is relative to this chunk; -1 is the last frame of the previous chunk
-        while self.pos < (frames.len() - 1) as f64 + 1e-9 {
+        let ratio = f64::from(a.rate) / f64::from(self.out_rate);
+        // below the output's Nyquist when downsampling; a little under the input's otherwise
+        let cutoff = (1.0 / ratio).min(1.0) * 0.95;
+        if self.kernel.as_ref().is_none_or(|k| (k.cutoff - cutoff).abs() > 1e-9) {
+            self.kernel = Some(Kernel::new(cutoff));
+        }
+        let kernel = self.kernel.as_ref().expect("kernel");
+        let whole = a.samples.len() / ch * ch;
+        self.hist.extend(a.samples[..whole].iter().map(|&s| f32::from(s) / 32768.0));
+        let frames = self.hist.len() / ch;
+        let step = ratio * self.speed;
+        let hist = &self.hist;
+        // frames before the start repeat the first one (no fade-in from silence)
+        let sample = |i: isize, c: usize| hist[i.clamp(0, frames as isize - 1) as usize * ch + c];
+        let mut w = [0f32; 2 * HALF_TAPS];
+        let mut frame = vec![0f32; ch];
+        loop {
             let i = self.pos.floor() as isize;
-            let t = (self.pos - i as f64) as f32;
-            let at = |c: usize| {
-                let a = sample(i, c);
-                let b = if i + 1 < frames.len() as isize { sample(i + 1, c) } else { a };
-                a + (b - a) * t
-            };
+            let frac = self.pos - i as f64;
+            let exact = frac < 1e-9 && (step - 1.0).abs() < 1e-12;
+            // the filter looks HALF_TAPS frames ahead
+            let need = if exact { i } else { i + HALF_TAPS as isize };
+            if need >= frames as isize {
+                break;
+            }
+            if exact {
+                for (c, v) in frame.iter_mut().enumerate() {
+                    *v = sample(i, c);
+                }
+            } else {
+                kernel.weights(frac, &mut w);
+                let first = i - HALF_TAPS as isize + 1;
+                for (c, v) in frame.iter_mut().enumerate() {
+                    *v = w.iter().enumerate().map(|(j, wj)| wj * sample(first + j as isize, c)).sum();
+                }
+            }
             match self.out_channels {
-                1 => out.push_back((0..ch).map(at).sum::<f32>() / ch as f32),
+                1 => out.push_back(frame.iter().sum::<f32>() / ch as f32),
                 n => {
                     for c in 0..n {
                         out.push_back(if c < ch {
-                            at(c)
+                            frame[c]
                         } else if ch == 1 {
-                            at(0)
+                            frame[0]
                         } else {
                             0.0
                         });
@@ -106,9 +208,12 @@ impl Converter {
             }
             self.pos += step;
         }
-        self.pos -= frames.len() as f64;
-        let last: Vec<f32> = (0..ch).map(|c| sample(frames.len() as isize - 1, c)).collect();
-        self.prev = last;
+        // keep what the filter still looks back at
+        let drop = (self.pos.floor() as isize - HALF_TAPS as isize).clamp(0, frames as isize) as usize;
+        if drop > 0 {
+            self.hist.drain(..drop * ch);
+            self.pos -= drop as f64;
+        }
     }
 }
 
@@ -179,7 +284,7 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
     std::thread::Builder::new()
         .name("audio-feed".into())
         .spawn(move || {
-            let mut conv = Converter { out_rate: rate, out_channels: channels, pos: 0.0, speed: 1.0, prev: Vec::new() };
+            let mut conv = Converter::new(rate, channels);
             let mut converted = VecDeque::new();
             let mut report = std::time::Instant::now();
             while let Ok(first) = rx.recv() {
@@ -194,8 +299,7 @@ pub fn spawn(rx: Receiver<Audio>, muted: Arc<AtomicBool>) -> bool {
                 };
                 if dropped > 0 {
                     // Do not interpolate between samples that were separated by a deliberate latency trim.
-                    conv.pos = 0.0;
-                    conv.prev.clear();
+                    conv.reset();
                 }
                 for chunk in chunks {
                     // Read only the steering state while locked. Resampling and temporary allocation must not
@@ -364,7 +468,7 @@ mod tests {
 
     #[test]
     fn same_rate_passes_through() {
-        let mut c = Converter { out_rate: 48_000, out_channels: 2, pos: 0.0, speed: 1.0, prev: Vec::new() };
+        let mut c = Converter::new(48_000, 2);
         let mut out = VecDeque::new();
         let a: Vec<i16> = (0..960).map(|i| (i * 10) as i16).collect();
         c.push(&chunk(48_000, a.clone()), &mut out);
@@ -375,13 +479,50 @@ mod tests {
 
     #[test]
     fn resamples_to_44_1_khz_and_mono() {
-        let mut c = Converter { out_rate: 44_100, out_channels: 1, pos: 0.0, speed: 1.0, prev: Vec::new() };
+        let mut c = Converter::new(44_100, 1);
         let mut out = VecDeque::new();
         for _ in 0..100 {
             c.push(&chunk(48_000, vec![1000; 960]), &mut out);
         }
         // 1 s of input → about 44100 mono samples
-        assert!((44_090..=44_110).contains(&out.len()), "{}", out.len());
+        // (less the filter's look-ahead of 16 input frames)
+        assert!((44_070..=44_110).contains(&out.len()), "{}", out.len());
         assert!(out.iter().all(|v| (v - 1000.0 / 32768.0).abs() < 1e-4));
+    }
+
+    /// Level in dB of a sine played through the converter, after a stretch at nudged speed has left the
+    /// position between samples.
+    fn level_after_nudge(f: f64) -> f64 {
+        let tone = |n: usize, start: usize| -> Vec<i16> {
+            (0..n)
+                .flat_map(|i| {
+                    let v = ((2.0 * std::f64::consts::PI * f * (start + i) as f64 / 48_000.0).sin() * 16_000.0) as i16;
+                    [v, v]
+                })
+                .collect()
+        };
+        let mut c = Converter::new(48_000, 2);
+        let mut out = VecDeque::new();
+        c.speed = 1.0 + NUDGE;
+        c.push(&chunk(48_000, tone(480, 0)), &mut out);
+        c.speed = 1.0;
+        let mut start = 480;
+        for _ in 0..20 {
+            c.push(&chunk(48_000, tone(480, start)), &mut out);
+            start += 480;
+        }
+        let tail: Vec<f32> = out.iter().skip(2 * 2000).step_by(2).copied().collect();
+        let rms =
+            (tail.iter().map(|v| (f64::from(*v) * 32768.0 / 16_000.0).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        20.0 * (rms * 2f64.sqrt()).log10()
+    }
+
+    #[test]
+    fn treble_survives_a_speed_nudge() {
+        // linear interpolation lost 5.5 dB at 16 kHz and 9.8 dB at 20 kHz here
+        for f in [1_000.0, 8_000.0, 16_000.0, 20_000.0] {
+            let db = level_after_nudge(f);
+            assert!(db.abs() < 0.3, "{f} Hz: {db:.2} dB");
+        }
     }
 }
