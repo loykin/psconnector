@@ -64,7 +64,13 @@ impl MetalFrames {
         let (w, h) = (pb.width(), pb.height());
         let planes = match frame.format {
             PixelFormat::Nv12 { .. } => vec![
-                Plane { index: 0, mtl: mtl::PixelFormat::R8UNorm, wgpu: wgpu::TextureFormat::R8Unorm, width: w, height: h },
+                Plane {
+                    index: 0,
+                    mtl: mtl::PixelFormat::R8UNorm,
+                    wgpu: wgpu::TextureFormat::R8Unorm,
+                    width: w,
+                    height: h,
+                },
                 Plane {
                     index: 1,
                     mtl: mtl::PixelFormat::Rg8UNorm,

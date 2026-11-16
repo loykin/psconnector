@@ -188,7 +188,10 @@ struct Corrected {
     size: (u32, u32),
 }
 
-fn present_pipeline(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+fn present_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("psconnector present shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("gpu_present.wgsl").into()),
@@ -242,7 +245,11 @@ fn present_pipeline(device: &wgpu::Device, target_format: wgpu::TextureFormat) -
             module: &shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState { format: target_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
@@ -576,7 +583,9 @@ mod tests {
 
     #[test]
     fn shaders_parse_and_validate() {
-        for (name, source) in [("gpu_video", include_str!("gpu_video.wgsl")), ("gpu_present", include_str!("gpu_present.wgsl"))] {
+        for (name, source) in
+            [("gpu_video", include_str!("gpu_video.wgsl")), ("gpu_present", include_str!("gpu_present.wgsl"))]
+        {
             let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| panic!("{name}: {e}"));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
                 .validate(&module)

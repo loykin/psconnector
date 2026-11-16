@@ -183,7 +183,13 @@ fn main() -> Result<()> {
     // a console given on the command line, or else the one used last time, is connected to right away
     let host = host.or_else(settings::last_host);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("PS5").with_inner_size([1280.0, 760.0]),
+        viewport: {
+            let v = egui::ViewportBuilder::default().with_title("PsConnector").with_inner_size([1280.0, 760.0]);
+            match app_icon() {
+                Some(icon) => v.with_icon(icon),
+                None => v,
+            }
+        },
         ..Default::default()
     };
     let session: Arc<Mutex<Option<Arc<Shared>>>> = Arc::new(Mutex::new(None));
@@ -360,12 +366,26 @@ impl eframe::App for App {
     }
 }
 
+/// The window and Dock / taskbar icon (drawn by `assets/appicon.swift`).
+fn app_icon() -> Option<egui::IconData> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../assets/icon.png")));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    (info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight).then(|| {
+        buf.truncate(info.buffer_size());
+        egui::IconData { rgba: buf, width: info.width, height: info.height }
+    })
+}
+
 fn setup_fonts(ctx: &egui::Context) {
-    let Ok(data) = std::fs::read(FONT) else { return };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("korean".into(), Arc::new(egui::FontData::from_owned(data)));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().insert(0, "korean".into());
+    if let Ok(data) = std::fs::read(FONT) {
+        fonts.font_data.insert("korean".into(), Arc::new(egui::FontData::from_owned(data)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().insert(0, "korean".into());
+        }
     }
+    theme::add_icon_font(&mut fonts);
     ctx.set_fonts(fonts);
 }

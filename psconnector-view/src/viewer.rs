@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::theme::icon;
 
 pub(crate) struct Viewer {
     pub(crate) shared: Arc<Shared>,
@@ -40,165 +41,283 @@ impl FpsMeter {
 }
 
 impl Viewer {
+    /// The bar keeps only what is used while playing (like an IDE's main toolbar): picture, one macro widget
+    /// whose contents follow its state, the stream's status, quality, sound and a ⋯ menu for rare or
+    /// disruptive actions.
     pub(crate) fn bar(&mut self, ui: &mut egui::Ui) {
-        // the bar holds many controls: tighter than the rest of the window
-        ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.add_space(2.0);
+        ui.spacing_mut().item_spacing.x = 4.0;
         let runner = self.runner.clone();
         let mut r = runner.lock().unwrap();
         let r = &mut *r;
         ui.horizontal(|ui| {
-            if theme::ghost(ui, true, "🎨 Picture")
+            ui.set_min_height(theme::size::CONTROL);
+            if theme::toggle_button(ui, icon::PICTURE, "Picture", self.picture_open)
                 .on_hover_text("Brightness, contrast, colour range and saved game presets")
                 .clicked()
             {
                 self.picture_open = !self.picture_open;
             }
-            let names: Vec<String> = match &r.macros {
-                Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
-                Err(_) => Vec::new(),
-            };
-            let idle = r.running.is_none();
-            let waiting = r.scheduled.is_some();
-            ui.add_enabled_ui(idle && !waiting && !names.is_empty(), |ui| {
-                let mut selected = r.selected;
-                egui::ComboBox::from_id_salt("macro")
-                    .selected_text(names.get(selected).cloned().unwrap_or_else(|| "no macros".into()))
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        for (i, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut selected, i, n);
-                        }
-                    });
-                if selected != r.selected {
-                    r.select(selected);
-                }
-                ui.add(
-                    egui::DragValue::new(&mut r.plan.limit_min)
-                        .range(0..=24 * 60)
-                        .custom_formatter(|v, _| if v < 1.0 { "no limit".into() } else { format!("{v:.0} min") }),
-                )
-                .on_hover_text(
-                    "Run time limit (drag or type, 0 = no limit). When it is reached, a macro that checks \
-                     ps.should_stop() gets 2 minutes to finish; others are stopped right away.",
-                );
-                egui::ComboBox::from_id_salt("after")
-                    .selected_text(r.plan.after.label())
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        for a in [After::Nothing, After::Standby] {
-                            ui.selectable_value(&mut r.plan.after, a, a.label());
-                        }
-                    })
-                    .response
-                    .on_hover_text("What to do when the macro ends by itself or at its time limit (not on ■ Stop)");
-            });
-            if !idle {
-                if theme::destructive(ui, true, "■ Stop").clicked() {
-                    r.stop();
-                }
-            } else if waiting {
-                if ui.button("Cancel schedule").clicked() {
-                    r.cancel_schedule();
-                }
-            } else {
-                if theme::primary(ui, !names.is_empty(), "▶ Run").clicked() {
-                    r.start();
-                }
-                ui.add(egui::TextEdit::singleline(&mut r.at_text).hint_text("HH:MM").desired_width(60.0))
-                    .on_hover_text("Start time: HH:MM (today, or tomorrow if already past) or +MINUTES");
-                if ui
-                    .add_enabled(!names.is_empty() && !r.at_text.trim().is_empty(), egui::Button::new("⏰ Schedule"))
-                    .clicked()
-                {
-                    r.schedule_selected();
-                }
-                if theme::ghost(ui, true, "Reload list").clicked() {
-                    r.reload();
-                }
-            }
-            let status = match (&r.running, &r.scheduled, &r.macros) {
-                (Some(run), _, _) => {
-                    let mut s = format!("{} running {}", run.name, hms(run.started.elapsed()));
-                    if let Some(d) = run.deadline {
-                        s += &format!(" · {} left", hms(d.saturating_duration_since(Instant::now())));
-                    }
-                    if run.plan.after == After::Standby {
-                        s += " · then rest mode";
-                    }
-                    if run.stop_sent.is_some() {
-                        s += " (stopping)";
-                    } else if run.wind_down.is_some() {
-                        s += " (finishing)";
-                    }
-                    s
-                }
-                (None, Some(sc), _) => {
-                    let name = names.get(sc.index).cloned().unwrap_or_default();
-                    let wait = sc.at.duration_since(SystemTime::now()).unwrap_or_default();
-                    format!("{name} starts at {} (in {})", sc.label, hms(wait))
-                }
-                (None, None, Err(e)) => e.clone(),
-                (None, None, Ok(_)) => {
-                    r.last_exit.clone().map(|e| format!("stopped ({e})")).unwrap_or_else(|| "idle".into())
-                }
-            };
-            ui.label(status);
-            let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
-            ui.add(egui::Label::new(egui::RichText::new(last).weak()).truncate());
+            theme::vsep(ui);
+            macro_widget(ui, r);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::ghost(ui, true, "Rest mode")
-                    .on_hover_text("Put the PS5 into rest mode (this also disconnects)")
-                    .clicked()
-                {
-                    r.stop();
-                    self.shared.client().standby();
-                    self.shared.leave.store(true, Ordering::SeqCst);
-                }
-                if theme::ghost(ui, true, "Disconnect")
-                    .on_hover_text("Close the connection and go back to the start screen")
-                    .clicked()
-                {
-                    self.shared.leave.store(true, Ordering::SeqCst);
-                }
+                self.more_menu(ui, r);
                 if self.shared.sound {
                     let muted = self.shared.muted.load(Ordering::Relaxed);
-                    if ui.button(if muted { "🔇" } else { "🔊" }).on_hover_text("Mute / unmute the PS5 sound").clicked()
+                    let glyph = if muted { icon::SPEAKER_OFF } else { icon::SPEAKER };
+                    if theme::icon_button(ui, glyph, if muted { "Unmute the PS5 sound" } else { "Mute the PS5 sound" })
+                        .clicked()
                     {
                         self.shared.muted.store(!muted, Ordering::Relaxed);
                     }
                 }
-                let current = *self.shared.quality.lock().unwrap();
-                let mut chosen = current;
-                let busy =
-                    self.shared.reconnecting.lock().unwrap().as_deref().is_some_and(|n| n.starts_with("reconnecting"));
-                ui.add_enabled_ui(!busy, |ui| {
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(current.label())
-                        .show_ui(ui, |ui| {
-                            for q in Quality::ALL {
-                                ui.selectable_value(&mut chosen, q, q.label());
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "Picture quality. Changing it reconnects (a few seconds). Remembered for next time.",
-                        );
-                });
-                if chosen != current {
-                    let _ = self.shared.set_quality(chosen);
-                }
-                if let Some(f) = &self.shown {
-                    ui.label(egui::RichText::new(format!("{}x{} {} fps", f.width, f.height, self.fps.fps)).weak());
-                }
+                self.quality_combo(ui);
+                ui.add_space(4.0);
                 let pad = self.shared.pad.lock().unwrap().clone();
-                match pad {
-                    Some(name) => ui.label(format!("🎮 {name}")),
-                    None => ui.label(egui::RichText::new("🎮 no controller").weak()),
-                };
+                let mut info = format!("{}  {}", icon::GAMEPAD, pad.as_deref().unwrap_or("no controller"));
+                if let Some(f) = &self.shown {
+                    info += &format!(" · {}p{}", f.height, self.fps.fps);
+                }
+                ui.add(egui::Label::new(theme::caption(ui, info)).truncate()).on_hover_text(match &self.shown {
+                    Some(f) => format!("{}×{} at {} frames per second", f.width, f.height, self.fps.fps),
+                    None => "no picture yet".into(),
+                });
             });
         });
+    }
+
+    fn quality_combo(&self, ui: &mut egui::Ui) {
+        let current = *self.shared.quality.lock().unwrap();
+        let mut chosen = current;
+        let busy = self.shared.reconnecting.lock().unwrap().as_deref().is_some_and(|n| n.starts_with("reconnecting"));
+        ui.add_enabled_ui(!busy, |ui| {
+            egui::ComboBox::from_id_salt("quality")
+                .selected_text(current.label())
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for q in Quality::ALL {
+                        ui.selectable_value(&mut chosen, q, q.label());
+                    }
+                })
+                .response
+                .on_hover_text("Picture quality. Changing it reconnects (a few seconds). Remembered for next time.");
+        });
+        if chosen != current {
+            let _ = self.shared.set_quality(chosen);
+        }
+    }
+
+    /// Actions that are rare or end the session.
+    fn more_menu(&self, ui: &mut egui::Ui, r: &mut Runner) {
+        let t = theme::tokens(ui);
+        let button = egui::Button::new(egui::RichText::new(icon::MORE).size(16.0))
+            .frame_when_inactive(false)
+            .min_size(egui::vec2(theme::size::CONTROL, theme::size::CONTROL));
+        let (resp, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+            ui.set_min_width(200.0);
+            if ui.button(format!("{}  Reload macro list", icon::RELOAD)).clicked() {
+                r.reload();
+            }
+            ui.separator();
+            if ui
+                .button(format!("{}  Disconnect", icon::DISCONNECT))
+                .on_hover_text("Close the connection and go back to the start screen")
+                .clicked()
+            {
+                self.shared.leave.store(true, Ordering::SeqCst);
+            }
+            let rest = egui::RichText::new(format!("{}  Rest mode", icon::POWER)).color(t.danger_text);
+            if ui.button(rest).on_hover_text("Put the PS5 into rest mode (this also disconnects)").clicked() {
+                r.stop();
+                self.shared.client().standby();
+                self.shared.leave.store(true, Ordering::SeqCst);
+            }
+        });
+        resp.on_hover_text("More");
+    }
+}
+
+/// Corner radius for the left or right end of a joined control.
+fn end_radius(left: bool) -> egui::CornerRadius {
+    let r = theme::size::RADIUS;
+    if left {
+        egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }
+    } else {
+        egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }
+    }
+}
+
+/// A square button at the right end of a joined control.
+fn end_button(ui: &mut egui::Ui, glyph: &str, fill: egui::Color32, enabled: bool) -> egui::Response {
+    let b = egui::Button::new(egui::RichText::new(glyph).size(14.0).color(egui::Color32::WHITE))
+        .fill(fill)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(end_radius(false))
+        .min_size(egui::vec2(30.0, theme::size::CONTROL));
+    ui.add_enabled(enabled, b)
+}
+
+/// A framed strip for the running and scheduled states of the macro widget.
+fn state_strip<R>(
+    ui: &mut egui::Ui,
+    fill: egui::Color32,
+    stroke: egui::Color32,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(theme::size::RADIUS))
+        .inner_margin(egui::Margin { left: 10, right: 0, top: 0, bottom: 0 })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                body(ui)
+            })
+            .inner
+        })
+        .inner
+}
+
+/// One widget for macros, like an IDE's run widget: what it shows depends on whether a macro is running,
+/// scheduled or idle, so the three never compete for space.
+fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
+    let t = theme::tokens(ui);
+    let names: Vec<String> = match &r.macros {
+        Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
+    if let Some(run) = &r.running {
+        let mut times = hms(run.started.elapsed());
+        if let Some(d) = run.deadline {
+            times += &format!(" · {} left", hms(d.saturating_duration_since(Instant::now())));
+        }
+        if run.plan.after == After::Standby {
+            times += " · then rest";
+        }
+        if run.stop_sent.is_some() {
+            times += " · stopping";
+        } else if run.wind_down.is_some() {
+            times += " · finishing";
+        }
+        let name = run.name.clone();
+        let stop = state_strip(ui, t.accent_soft, t.accent, |ui| {
+            theme::status_dot(ui, t.success);
+            ui.label(&name);
+            ui.label(egui::RichText::new(times).color(t.muted));
+            end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop the macro").clicked()
+        });
+        if stop {
+            r.stop();
+        }
+        let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(egui::RichText::new(last).size(theme::size::CAPTION).color(t.faint)).truncate());
+        return;
+    }
+    if let Some(sc) = &r.scheduled {
+        let name = names.get(sc.index).cloned().unwrap_or_default();
+        let wait = sc.at.duration_since(SystemTime::now()).unwrap_or_default();
+        let label = format!("{name} · {}", sc.label);
+        let cancel = state_strip(ui, egui::Color32::TRANSPARENT, t.faint, |ui| {
+            ui.label(egui::RichText::new(icon::CLOCK).color(t.muted));
+            ui.label(label);
+            ui.label(egui::RichText::new(format!("in {}", hms(wait))).color(t.muted));
+            let b = egui::Button::new("Cancel")
+                .frame_when_inactive(false)
+                .corner_radius(end_radius(false))
+                .min_size(egui::vec2(0.0, theme::size::CONTROL));
+            ui.add(b).clicked()
+        });
+        if cancel {
+            r.cancel_schedule();
+        }
+        return;
+    }
+    let has = !names.is_empty();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_enabled_ui(has, |ui| {
+            let w = &mut ui.visuals_mut().widgets;
+            for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+                v.corner_radius = end_radius(true);
+            }
+            let mut selected = r.selected;
+            let combo = egui::ComboBox::from_id_salt("macro")
+                .selected_text(names.get(selected).cloned().unwrap_or_else(|| "no macros".into()))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut selected, i, n);
+                    }
+                })
+                .response;
+            if let Err(e) = &r.macros {
+                combo.on_disabled_hover_text(e.clone());
+            }
+            if selected != r.selected {
+                r.select(selected);
+            }
+        });
+        if end_button(ui, icon::PLAY, t.accent, has).on_hover_text("Run the macro now").clicked() {
+            r.start();
+        }
+    });
+    let button = egui::Button::new(egui::RichText::new(icon::SLIDERS).size(16.0))
+        .frame_when_inactive(false)
+        .min_size(egui::vec2(theme::size::CONTROL, theme::size::CONTROL));
+    let options = egui::containers::menu::MenuButton::from_button(button).config(
+        egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+    );
+    let (resp, _) = options.ui(ui, |ui| {
+        ui.set_min_width(260.0);
+        theme::section_label(ui, "Macro options");
+        egui::Grid::new("macro_options").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+            ui.label("Time limit");
+            ui.add(
+                egui::DragValue::new(&mut r.plan.limit_min)
+                    .range(0..=24 * 60)
+                    .custom_formatter(|v, _| if v < 1.0 { "no limit".into() } else { format!("{v:.0} min") }),
+            )
+            .on_hover_text(
+                "Drag or type, 0 = no limit. When it is reached, a macro that checks ps.should_stop() gets \
+                 2 minutes to finish; others are stopped right away.",
+            );
+            ui.end_row();
+            ui.label("When done");
+            theme::segmented(ui, &mut r.plan.after, &[(After::Nothing, "Nothing"), (After::Standby, "Rest mode")]);
+            ui.end_row();
+            ui.label("Start at");
+            ui.horizontal(|ui| {
+                ui.add(theme::field(&mut r.at_text, theme::size::CONTROL).hint_text("HH:MM").desired_width(64.0))
+                    .on_hover_text("HH:MM (today, or tomorrow if already past) or +MINUTES");
+                let can = has && !r.at_text.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new(format!("{}  Schedule", icon::CLOCK))).clicked() {
+                    r.schedule_selected();
+                    ui.close();
+                }
+            });
+            ui.end_row();
+        });
+        let last = match &r.macros {
+            Err(e) => e.clone(),
+            Ok(_) => r.last_exit.clone().map(|e| format!("Last run: {e}")).unwrap_or_default(),
+        };
+        if !last.is_empty() {
+            ui.separator();
+            ui.label(theme::caption(ui, last));
+        }
+    });
+    resp.on_hover_text("Time limit, what to do afterwards, start time");
+    // the settings that change what ▶ does stay visible without opening the menu
+    let mut summary = Vec::new();
+    if r.plan.limit_min > 0 {
+        summary.push(format!("{} min", r.plan.limit_min));
+    }
+    if r.plan.after == After::Standby {
+        summary.push("then rest".into());
+    }
+    if !summary.is_empty() {
+        ui.label(theme::caption(ui, summary.join(" · ")));
     }
 }
 
@@ -250,104 +369,134 @@ impl Viewer {
         Self::builtin_presets().into_iter().chain(Self::saved_presets()).collect()
     }
 
-    pub(crate) fn picture_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.picture_open;
+    /// The picture controls, as a panel beside the video so the change can be watched while sliding.
+    pub(crate) fn picture_panel(&mut self, ui: &mut egui::Ui) {
+        let t = theme::tokens(ui);
         let mut p = *self.shared.picture.lock().unwrap();
         let before = p;
-        egui::Window::new("Picture").open(&mut open).resizable(false).default_width(300.0).show(ctx, |ui| {
-            ui.label(theme::muted(ui, "Changes only what you see here; macros and screenshots get the original."));
-            let current_codec = *self.shared.video_codec.lock().unwrap();
-            let mut chosen_codec = current_codec;
+        let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(16));
+        egui::Panel::right("picture").exact_size(320.0).resizable(false).frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Stream codec");
-                egui::ComboBox::from_id_salt("video_codec").selected_text(video_codec_name(current_codec)).show_ui(
-                    ui,
-                    |ui| {
-                        ui.selectable_value(&mut chosen_codec, VideoCodec::H264, "H.264 SDR");
-                        ui.selectable_value(&mut chosen_codec, VideoCodec::H265, "H.265 SDR");
-                        ui.selectable_value(&mut chosen_codec, VideoCodec::H265Hdr, "H.265 HDR (tone-mapped)");
-                    },
-                );
+                ui.label(egui::RichText::new("Picture").strong().size(theme::size::TITLE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::icon_button(ui, icon::CLOSE, "Close").clicked() {
+                        self.picture_open = false;
+                    }
+                });
             });
-            if chosen_codec != current_codec {
-                let _ = self.shared.set_video_codec(chosen_codec);
-            }
+            ui.label(theme::caption(ui, "Changes only what you see here; macros and screenshots get the original."));
+            ui.add_space(8.0);
+
             let current_range = *self.shared.video_range.lock().unwrap();
-            let mut chosen_range = current_range;
-            ui.horizontal(|ui| {
-                ui.label("Source range");
-                egui::ComboBox::from_id_salt("video_range").selected_text(video_range_name(current_range)).show_ui(
-                    ui,
-                    |ui| {
-                        ui.selectable_value(&mut chosen_range, VideoRange::Auto, "auto");
-                        ui.selectable_value(&mut chosen_range, VideoRange::Limited, "limited");
-                        ui.selectable_value(&mut chosen_range, VideoRange::Full, "full");
-                    },
-                );
-            });
-            if chosen_range != current_range {
-                self.shared.set_video_range(chosen_range);
-            }
             let presets = Self::picture_presets();
             let current = presets
                 .iter()
                 .find(|(_, v, range)| *v == p && range.is_none_or(|r| r == current_range))
                 .map(|(n, _, _)| n.clone())
                 .unwrap_or_else(|| "Custom".into());
-            egui::ComboBox::from_id_salt("picture_preset").selected_text(&current).width(220.0).show_ui(ui, |ui| {
-                for (name, v, range) in &presets {
-                    let selected = *v == p && range.is_none_or(|r| r == current_range);
-                    if ui.selectable_label(selected, name).clicked() {
-                        p = *v;
-                        if let Some(range) = range {
-                            self.shared.set_video_range(*range);
+            theme::section_label(ui, "Preset");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("picture_preset").selected_text(&current).width(190.0).show_ui(ui, |ui| {
+                    for (name, v, range) in &presets {
+                        let selected = *v == p && range.is_none_or(|r| r == current_range);
+                        if ui.selectable_label(selected, name).clicked() {
+                            p = *v;
+                            if let Some(range) = range {
+                                self.shared.set_video_range(*range);
+                            }
                         }
                     }
+                });
+                let save =
+                    egui::Button::new(format!("{}  Save", icon::SAVE)).min_size(egui::vec2(0.0, theme::size::CONTROL));
+                let config = egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+                egui::containers::menu::MenuButton::from_button(save).config(config).ui(ui, |ui| {
+                    ui.set_min_width(240.0);
+                    ui.label(theme::caption(ui, "Save the current picture as a preset"));
+                    ui.add(
+                        theme::field(&mut self.preset_name, theme::size::CONTROL)
+                            .hint_text("Preset name")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if theme::primary(ui, !self.preset_name.trim().is_empty(), "Save").clicked() {
+                            Self::save_preset(self.preset_name.trim(), p, *self.shared.video_range.lock().unwrap());
+                            self.preset_name.clear();
+                            ui.close();
+                        }
+                        let can_delete = current != "Original" && current != "Custom";
+                        if theme::ghost(ui, can_delete, &format!("{}  Delete \"{current}\"", icon::TRASH)).clicked() {
+                            Self::delete_preset(&current);
+                            ui.close();
+                        }
+                    });
+                });
+            });
+            ui.add_space(12.0);
+
+            theme::section_label(ui, "Source");
+            egui::Grid::new("picture_source").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Codec");
+                let mut codec = *self.shared.video_codec.lock().unwrap();
+                if theme::segmented(
+                    ui,
+                    &mut codec,
+                    &[(VideoCodec::H264, "H.264"), (VideoCodec::H265, "H.265"), (VideoCodec::H265Hdr, "HDR")],
+                ) {
+                    let _ = self.shared.set_video_codec(codec);
                 }
-            });
-            ui.add_space(4.0);
-            egui::Grid::new("picture_sliders").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Brightness");
-                ui.add(egui::Slider::new(&mut p.brightness, -0.5..=0.5)).on_hover_text("Overall exposure");
                 ui.end_row();
-                ui.label("Shadows");
-                ui.add(egui::Slider::new(&mut p.shadows, 0.0..=1.0)).on_hover_text("Lift dark areas");
-                ui.end_row();
-                ui.label("Highlights");
-                ui.add(egui::Slider::new(&mut p.highlights, 0.0..=1.0)).on_hover_text("Pull bright areas down");
-                ui.end_row();
-                ui.label("Contrast");
-                ui.add(egui::Slider::new(&mut p.contrast, -0.5..=0.5));
-                ui.end_row();
-                ui.label("Saturation");
-                ui.add(egui::Slider::new(&mut p.saturation, 0.0..=1.5));
-                ui.end_row();
-                ui.label("Warmth");
-                ui.add(egui::Slider::new(&mut p.warmth, -1.0..=1.0))
-                    .on_hover_text("Less blue (right) or more blue (left)");
-                ui.end_row();
-                ui.label("Shadow tint");
-                ui.add(egui::Slider::new(&mut p.shadow_tint, 0.0..=1.0))
-                    .on_hover_text("Take the colour cast out of dark areas");
+                ui.label("Range");
+                let mut range = current_range;
+                if theme::segmented(
+                    ui,
+                    &mut range,
+                    &[(VideoRange::Auto, "Auto"), (VideoRange::Limited, "Limited"), (VideoRange::Full, "Full")],
+                ) {
+                    self.shared.set_video_range(range);
+                }
                 ui.end_row();
             });
+            ui.add_space(12.0);
+
             ui.horizontal(|ui| {
-                if ui.button("Reset all").clicked() {
-                    p = picture::Picture::default();
-                    self.shared.set_video_range(VideoRange::Auto);
-                }
-                ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(120.0).hint_text("preset name"));
-                if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
-                    Self::save_preset(self.preset_name.trim(), p, *self.shared.video_range.lock().unwrap());
-                    self.preset_name.clear();
-                }
-                let can_delete = current != "Original" && current != "Custom";
-                if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
-                    Self::delete_preset(&current);
-                }
+                theme::section_label(ui, "Adjust");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let reset = egui::Button::new(
+                        egui::RichText::new("Reset all").size(theme::size::CAPTION).color(t.accent_text),
+                    )
+                    .frame(false);
+                    if ui.add(reset).clicked() {
+                        p = picture::Picture::default();
+                        self.shared.set_video_range(VideoRange::Auto);
+                    }
+                });
             });
+            let sliders: [(&str, &mut f32, std::ops::RangeInclusive<f32>, &str); 7] = [
+                ("Brightness", &mut p.brightness, -0.5..=0.5, "Overall exposure"),
+                ("Shadows", &mut p.shadows, 0.0..=1.0, "Lift dark areas"),
+                ("Highlights", &mut p.highlights, 0.0..=1.0, "Pull bright areas down"),
+                ("Contrast", &mut p.contrast, -0.5..=0.5, ""),
+                ("Saturation", &mut p.saturation, 0.0..=1.5, ""),
+                ("Warmth", &mut p.warmth, -1.0..=1.0, "Less blue (right) or more blue (left)"),
+                ("Shadow tint", &mut p.shadow_tint, 0.0..=1.0, "Take the colour cast out of dark areas"),
+            ];
+            for (name, value, range, hint) in sliders {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:+.2}", *value)).color(t.muted).monospace());
+                    });
+                });
+                ui.spacing_mut().slider_width = ui.available_width();
+                let r = ui.add(egui::Slider::new(value, range).show_value(false));
+                if !hint.is_empty() {
+                    r.on_hover_text(hint);
+                }
+            }
         });
-        self.picture_open = open;
         if p != before {
             self.shared.set_picture(p);
         }
@@ -361,7 +510,12 @@ impl Viewer {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        egui::Panel::top("bar").show(ui, |ui| self.bar(ui));
+        let t = theme::tokens(ui);
+        let bar = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::symmetric(8, 6));
+        egui::Panel::top("bar").frame(bar).show(ui, |ui| self.bar(ui));
+        if self.picture_open {
+            self.picture_panel(ui);
+        }
 
         let latest = self.shared.client().frame();
         let version = self.shared.picture_version.load(Ordering::SeqCst);
@@ -417,9 +571,6 @@ impl Viewer {
                 }
                 self.upload = (0, Duration::ZERO, Some(Instant::now()));
             }
-        }
-        if self.picture_open {
-            self.picture_window(&ctx);
         }
         // draw into the remaining area at 16:9
         let area = ui.available_rect_before_wrap();

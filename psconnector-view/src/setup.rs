@@ -51,6 +51,19 @@ pub struct Setup {
     error: Option<String>,
 }
 
+/// Sends the wake-up packet and waits until the console reports that it is on.
+async fn wake_up(addr: &str, host_id: &str) -> Result<(), String> {
+    let reg = profile::load_any(None, host_id).map_err(|e| e.to_string())?;
+    ddp::wakeup(addr, &reg.regist_key).await.map_err(|e| e.to_string())?;
+    for _ in 0..45 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if ddp::status(addr).await.is_ok_and(|s| s.is_on()) {
+            return Ok(());
+        }
+    }
+    Err("the PS5 did not wake up within 90 s".into())
+}
+
 fn registered(host_id: Option<&str>) -> bool {
     host_id.is_some_and(|id| profile::load_any(None, id).is_ok())
 }
@@ -140,7 +153,8 @@ impl Setup {
         }
     }
 
-    /// Checks the console, and connects if it is on and registered (else the screen shows what to do).
+    /// Checks the console and connects, waking it first if it is in rest mode (one button, like the
+    /// official app). An unpaired console stops here and the screen shows what to do.
     fn connect(&mut self, addr: String) {
         self.error = None;
         self.busy = Some(format!("connecting to {addr}..."));
@@ -153,44 +167,25 @@ impl Setup {
                     return;
                 }
             };
-            let ready = st.is_on() && registered(st.host_id());
+            let on = st.is_on();
+            let host_id = st.host_id().map(str::to_string);
+            let paired = registered(host_id.as_deref());
             let _ = tx.send(Msg::Status(addr.clone(), Ok(st)));
-            if ready {
-                let r = crate::connect(&addr, opts).await.map(|c| (addr, c)).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Msg::Connected(r));
+            if !paired {
+                return;
             }
-        });
-    }
-
-    fn wake(&mut self, addr: String, host_id: String) {
-        self.error = None;
-        self.busy = Some(format!("waking {addr}..."));
-        let (tx, opts) = (self.tx.clone(), self.opts.clone());
-        self.rt.spawn(async move {
-            let result: Result<(), String> = async {
-                let reg = profile::load_any(None, &host_id).map_err(|e| e.to_string())?;
-                ddp::wakeup(&addr, &reg.regist_key).await.map_err(|e| e.to_string())?;
-                for _ in 0..45 {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if ddp::status(&addr).await.is_ok_and(|s| s.is_on()) {
-                        return Ok(());
-                    }
-                }
-                Err("the PS5 did not wake up within 90 s".into())
-            }
-            .await;
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(Msg::Note(format!("PS5 is on; connecting to {addr}...")));
-                    // the console needs a few seconds after waking before it takes a session
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let r = crate::connect(&addr, opts).await.map(|c| (addr, c)).map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(Msg::Connected(r));
-                }
-                Err(e) => {
+            if !on {
+                let _ = tx.send(Msg::Note(format!("waking {addr} from rest mode...")));
+                if let Err(e) = wake_up(&addr, &host_id.unwrap_or_default()).await {
                     let _ = tx.send(Msg::Connected(Err(e)));
+                    return;
                 }
+                let _ = tx.send(Msg::Note(format!("PS5 is on; connecting to {addr}...")));
+                // the console needs a few seconds after waking before it takes a session
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
+            let r = crate::connect(&addr, opts).await.map(|c| (addr, c)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Connected(r));
         });
     }
 
@@ -284,16 +279,15 @@ impl Setup {
             Msg::Status(addr, Ok(st)) => {
                 let (on, reg) = (st.is_on(), registered(st.host_id()));
                 self.add_status(&addr, &st, None);
-                if !on || !reg {
+                // a paired console in rest mode is being woken by connect()
+                if !reg {
                     self.busy = None;
-                    self.error = Some(if !reg && !on {
+                    self.error = Some(if !on {
                         format!(
                             "{addr} is not paired with this computer yet. Turn the PS5 on (power button or its controller), then press Pair"
                         )
-                    } else if !reg {
-                        format!("{addr} is not paired with this computer yet: press Pair")
                     } else {
-                        format!("{addr} is in rest mode: press Wake")
+                        format!("{addr} is not paired with this computer yet: press Pair")
                     });
                     if self.consoles.len() == 1 {
                         self.search(); // also look for others
@@ -383,144 +377,182 @@ impl Setup {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, idle: bool, action: &mut Option<Action>) {
-        ui.add_space(28.0);
-        ui.heading(egui::RichText::new("PsConnector").strong());
-        ui.label(theme::muted(ui, "Connect to a PS5 on this network."));
+        let t = theme::tokens(ui);
+        ui.add_space(40.0);
+        ui.label(egui::RichText::new("PsConnector").strong().size(theme::size::HEADING));
+        ui.label(theme::muted(ui, "Remote Play to a PS5 on this network."));
         ui.add_space(16.0);
 
-        // ---- account
-        let (title, desc) = match &self.account {
-            Some((a, _)) => ("PSN account", format!("Signed in as {}", a.online_id)),
-            None => ("PSN account", "Needed once, to pair this computer with a PS5.".to_string()),
-        };
-        theme::card(ui, title, Some(&desc), |ui| {
-            ui.horizontal(|ui| {
-                let label = if self.account.is_some() { "Sign in again" } else { "Sign in to PSN" };
-                let main = if self.account.is_some() {
-                    ui.add_enabled(idle, egui::Button::new(label))
-                } else {
-                    theme::primary(ui, idle, label)
-                };
-                if main.clicked() {
-                    *action = Some(Box::new(|s: &mut Self| s.sign_in()));
-                }
-                if theme::ghost(ui, idle, "Use the browser")
-                    .on_hover_text("Sign in in your web browser and paste the address back")
-                    .clicked()
-                {
-                    *action = Some(Box::new(|s: &mut Self| s.sign_in_with_browser()));
-                }
-                if self.account.is_some() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::ghost(ui, idle, "Sign out").clicked() {
-                            *action = Some(Box::new(|s: &mut Self| s.confirm = Some(Confirm::SignOut)));
+        // ---- account: a card only while it needs doing; once signed in it is a line at the bottom
+        if self.account.is_none() || self.login.is_some() {
+            let desc = match &self.account {
+                Some((a, _)) => format!("Signed in as {}", a.online_id),
+                None => "Needed once, to pair this computer with a PS5.".to_string(),
+            };
+            theme::card(ui, "PSN account", Some(&desc), |ui| {
+                if self.login.is_none() {
+                    ui.horizontal(|ui| {
+                        if theme::primary(ui, idle, "Sign in to PSN").clicked() {
+                            *action = Some(Box::new(|s: &mut Self| s.sign_in()));
+                        }
+                        if theme::ghost(ui, idle, "Use the browser")
+                            .on_hover_text("Sign in in your web browser and paste the address back")
+                            .clicked()
+                        {
+                            *action = Some(Box::new(|s: &mut Self| s.sign_in_with_browser()));
                         }
                     });
                 }
-            });
-            if let Some(text) = &mut self.login {
-                ui.add_space(6.0);
-                ui.label("1. Sign in on Sony's page that opened in your browser. The password goes only to Sony.");
-                ui.horizontal(|ui| {
-                    if theme::ghost(ui, true, "Copy the sign-in link").clicked() {
-                        ui.ctx().copy_text(psn::login_url());
+                if let Some(text) = &mut self.login {
+                    ui.label("1. Sign in on Sony's page that opened in your browser. The password goes only to Sony.");
+                    ui.horizontal(|ui| {
+                        if theme::ghost(ui, true, "Copy the sign-in link").clicked() {
+                            ui.ctx().copy_text(psn::login_url());
+                        }
+                        ui.label(theme::caption(ui, "if no browser opened"));
+                    });
+                    ui.label("2. Paste the address of the page you land on (…/remoteplay/redirect?code=…):");
+                    let mut submit = false;
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 160.0).max(160.0);
+                        let r = ui.add(
+                            theme::field(text, theme::size::FORM)
+                                .desired_width(w)
+                                .hint_text("https://remoteplay.dl.playstation.net/remoteplay/redirect?code=..."),
+                        );
+                        submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        submit |= theme::primary(ui, idle && !text.trim().is_empty(), "OK").clicked();
+                        if theme::ghost(ui, true, "Cancel").clicked() {
+                            *action = Some(Box::new(|s: &mut Self| s.login = None));
+                        }
+                    });
+                    if submit && !text.trim().is_empty() {
+                        let url = text.trim().to_string();
+                        *action = Some(Box::new(move |s: &mut Self| s.finish_login(url)));
                     }
-                    ui.label(theme::muted(ui, "if no browser opened"));
-                });
-                ui.label("2. Paste the address of the page you land on (…/remoteplay/redirect?code=…):");
-                let mut submit = false;
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 150.0).max(160.0);
-                    let r = ui.add(
-                        egui::TextEdit::singleline(text)
-                            .desired_width(w)
-                            .hint_text("https://remoteplay.dl.playstation.net/remoteplay/redirect?code=..."),
-                    );
-                    submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    submit |= theme::primary(ui, idle && !text.trim().is_empty(), "OK").clicked();
-                    if ui.button("Cancel").clicked() {
-                        *action = Some(Box::new(|s: &mut Self| s.login = None));
-                    }
-                });
-                if submit && !text.trim().is_empty() {
-                    let url = text.trim().to_string();
-                    *action = Some(Box::new(move |s: &mut Self| s.finish_login(url)));
                 }
-            }
-        });
-        ui.add_space(12.0);
+            });
+            ui.add_space(12.0);
+        }
 
-        // ---- consoles
-        theme::card(ui, "Consoles", Some("PS5s that answered on this network, on or in rest mode."), |ui| {
-            if self.consoles.is_empty() {
+        // ---- consoles: one card each
+        if self.consoles.is_empty() {
+            theme::card(ui, if self.searching { "Searching…" } else { "No PS5 found" }, None, |ui| {
                 ui.label(theme::muted(
                     ui,
-                    if self.searching {
-                        "Searching..."
-                    } else {
-                        "No PS5 found. Check that it is on (or in rest mode with Remote Play enabled) and on this network, or type its address below."
-                    },
+                    "Check that it is on (or in rest mode with Remote Play enabled) and on this network, or type its address below.",
                 ));
-            }
-            for c in &self.consoles {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(&c.name).strong());
-                        ui.label(theme::muted(ui, &c.addr).size(12.0));
-                    });
-                    theme::badge(ui, if c.on { "on" } else { "rest mode" }, c.on);
-                    theme::badge(ui, if c.registered { "paired" } else { "not paired" }, false);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (addr, id) = (c.addr.clone(), c.host_id.clone());
-                        if !c.registered {
-                            let can = idle && self.account.is_some() && c.on;
-                            if theme::primary(ui, can, "Pair")
-                                .on_disabled_hover_text("Sign in to PSN first, and turn the PS5 on")
+            });
+        }
+        for c in &self.consoles {
+            egui::Frame::new()
+                .fill(t.surface)
+                .stroke(egui::Stroke::new(1.0, t.border))
+                .corner_radius(egui::CornerRadius::same(theme::size::PANEL_RADIUS))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        egui::Frame::new()
+                            .fill(t.raised)
+                            .stroke(egui::Stroke::new(1.0, t.border))
+                            .corner_radius(egui::CornerRadius::same(theme::size::PANEL_RADIUS))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(theme::icon::CONSOLE).size(22.0).color(t.muted))
+                            });
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&c.name).strong().size(theme::size::TITLE));
+                                if c.on {
+                                    theme::badge(ui, "On", theme::Tone::Success);
+                                } else {
+                                    theme::badge(ui, "Rest mode", theme::Tone::Neutral);
+                                }
+                            });
+                            let paired = if c.registered { "paired" } else { "not paired" };
+                            ui.label(theme::caption(ui, format!("{} · {paired}", c.addr)));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if c.registered
+                                && let Some(id) = c.host_id.clone()
+                            {
+                                let name = c.name.clone();
+                                let button = egui::Button::new(egui::RichText::new(theme::icon::MORE).size(16.0))
+                                    .frame_when_inactive(false)
+                                    .min_size(egui::vec2(theme::size::FORM, theme::size::FORM));
+                                egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            idle,
+                                            egui::Button::new(format!("{}  Forget this PS5", theme::icon::TRASH)),
+                                        )
+                                        .on_hover_text("Remove this console's pairing from this computer")
+                                        .clicked()
+                                    {
+                                        *action = Some(Box::new(move |s: &mut Self| {
+                                            s.confirm = Some(Confirm::Forget { host_id: id, name })
+                                        }));
+                                    }
+                                });
+                            }
+                            let addr = c.addr.clone();
+                            if !c.registered {
+                                let can = idle && self.account.is_some() && c.on;
+                                if theme::primary(ui, can, "Pair")
+                                    .on_disabled_hover_text("Sign in to PSN first, and turn the PS5 on")
+                                    .clicked()
+                                {
+                                    *action = Some(Box::new(move |s: &mut Self| s.pair = Some((addr, String::new()))));
+                                }
+                            } else if theme::primary(ui, idle, "Connect")
+                                .on_hover_text(if c.on {
+                                    "Start Remote Play"
+                                } else {
+                                    "Wake the PS5 from rest mode and start Remote Play"
+                                })
                                 .clicked()
                             {
-                                *action = Some(Box::new(move |s: &mut Self| s.pair = Some((addr, String::new()))));
+                                *action = Some(Box::new(move |s: &mut Self| s.connect(addr)));
                             }
-                        } else if !c.on {
-                            if theme::primary(ui, idle, "Wake").clicked() {
-                                *action = Some(Box::new(move |s: &mut Self| s.wake(addr, id.unwrap_or_default())));
-                            }
-                        } else if theme::primary(ui, idle, "Connect").clicked() {
-                            *action = Some(Box::new(move |s: &mut Self| s.connect(addr)));
-                        }
-                        if c.registered
-                            && let Some(id) = c.host_id.clone()
-                            && theme::ghost(ui, idle, "Forget")
-                                .on_hover_text("Remove this console's pairing from this computer")
-                                .clicked()
-                        {
-                            let name = c.name.clone();
-                            *action = Some(Box::new(move |s: &mut Self| {
-                                s.confirm = Some(Confirm::Forget { host_id: id, name })
-                            }));
-                        }
+                        });
                     });
                 });
-            }
-            ui.separator();
+            ui.add_space(4.0);
+        }
+
+        // ---- what is happening right now
+        if let Some(b) = &self.busy {
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.manual)
-                        .desired_width(170.0)
-                        .hint_text("Address, e.g. 192.0.2.10"),
-                );
-                if ui.add_enabled(idle && !self.manual.trim().is_empty(), egui::Button::new("Connect")).clicked() {
-                    let addr = self.manual.trim().to_string();
-                    *action = Some(Box::new(move |s: &mut Self| s.connect(addr)));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.searching {
-                        ui.spinner();
-                    } else if theme::ghost(ui, idle, "Search again").clicked() {
-                        *action = Some(Box::new(|s: &mut Self| s.search()));
-                    }
-                });
+                ui.add_space(4.0);
+                ui.spinner();
+                ui.label(theme::muted(ui, b));
             });
+        }
+        ui.add_space(8.0);
+
+        // ---- another console by address
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 200.0).max(160.0);
+            let r = ui.add(
+                theme::field(&mut self.manual, theme::size::FORM)
+                    .desired_width(w)
+                    .hint_text("Other PS5: address, e.g. 192.0.2.10"),
+            );
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let can = idle && !self.manual.trim().is_empty();
+            if theme::secondary(ui, can, "Connect").clicked() || (enter && can) {
+                let addr = self.manual.trim().to_string();
+                *action = Some(Box::new(move |s: &mut Self| s.connect(addr)));
+            }
+            if self.searching {
+                ui.spinner();
+            } else if theme::ghost(ui, idle, "Search again").clicked() {
+                *action = Some(Box::new(|s: &mut Self| s.search()));
+            }
         });
 
         // ---- pairing
@@ -535,14 +567,17 @@ impl Setup {
                 |ui| {
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(pin).desired_width(120.0).char_limit(8).hint_text("12345678"),
+                            theme::field(pin, theme::size::FORM)
+                                .desired_width(120.0)
+                                .char_limit(8)
+                                .hint_text("12345678"),
                         );
                         pin.retain(|c| c.is_ascii_digit());
                         let (a, p) = (addr.clone(), pin.clone());
                         if theme::primary(ui, idle && p.len() == 8, "Pair").clicked() {
                             *action = Some(Box::new(move |s: &mut Self| s.pair_with(a, p)));
                         }
-                        if ui.button("Cancel").clicked() {
+                        if theme::ghost(ui, true, "Cancel").clicked() {
                             *action = Some(Box::new(|s: &mut Self| s.pair = None));
                         }
                     });
@@ -574,22 +609,57 @@ impl Setup {
                             None => {}
                         }));
                     }
-                    if ui.button("Cancel").clicked() {
+                    if theme::ghost(ui, true, "Cancel").clicked() {
                         *action = Some(Box::new(|s: &mut Self| s.confirm = None));
                     }
                 });
             });
         }
 
-        ui.add_space(14.0);
-        if let Some(b) = &self.busy {
+        if let Some(e) = &self.error {
+            ui.add_space(12.0);
+            let (title, body) = explain_error(e);
+            theme::banner(ui, title.as_deref(), &body);
+        }
+
+        // ---- signed-in account, out of the way
+        if let Some((a, _)) = &self.account
+            && self.login.is_none()
+        {
+            ui.add_space(24.0);
+            ui.separator();
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(theme::muted(ui, b));
+                ui.label(theme::caption(ui, format!("{}  Signed in to PSN as {}", theme::icon::USER, a.online_id)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::ghost(ui, idle, "Sign out").clicked() {
+                        *action = Some(Box::new(|s: &mut Self| s.confirm = Some(Confirm::SignOut)));
+                    }
+                    if theme::ghost(ui, idle, "Sign in again").clicked() {
+                        *action = Some(Box::new(|s: &mut Self| s.sign_in()));
+                    }
+                });
             });
         }
-        if let Some(e) = &self.error {
-            theme::error(ui, e);
-        }
     }
+}
+
+/// Turns errors the user can fix into a title and what to do; others are shown as they are.
+fn explain_error(e: &str) -> (Option<String>, String) {
+    let addr = e.split(':').next().unwrap_or("").trim();
+    if e.contains("os error 51") || e.contains("os error 65") || e.contains("Network is unreachable") {
+        let title = if addr.is_empty() || addr.contains(' ') {
+            "Cannot reach the PS5".into()
+        } else {
+            format!("Cannot reach {addr}")
+        };
+        return (
+            Some(title),
+            format!(
+                "Direct connections to the PS5 are blocked or routed elsewhere ({}). A VPN that covers this network does this; \
+                 on macOS the app may also need Local Network access (System Settings → Privacy & Security → Local Network).",
+                e.rsplit(':').next().unwrap_or(e).trim()
+            ),
+        );
+    }
+    (None, e.to_string())
 }
