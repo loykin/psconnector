@@ -287,6 +287,24 @@ impl Runner {
         }
     }
 
+    /// Deletes the selected macro if it is a recording made with Record (other macros may be whole
+    /// repositories linked in, so they are left to the person). Returns what happened, for the bar.
+    pub(crate) fn delete_selected(&mut self) -> Result<String, String> {
+        if self.running.is_some() || self.scheduled.is_some() {
+            return Err("stop or cancel the macro first".into());
+        }
+        let m = self.macros.as_ref().ok().and_then(|l| l.get(self.selected)).cloned().ok_or("no macro selected")?;
+        let rec = m.recording.as_ref().ok_or("only recordings made with Record can be deleted here")?;
+        let dir = rec.parent().ok_or("recording has no folder")?;
+        let msg = remove_recording(dir, &self.sources, trash_dir().as_deref())?;
+        let index = self.selected;
+        self.reload();
+        let count = self.macros.as_ref().map(Vec::len).unwrap_or(0);
+        self.select(index.min(count.saturating_sub(1)));
+        log::info!("{}: {msg}", m.name);
+        Ok(format!("{}: {msg}", m.name))
+    }
+
     pub(crate) fn push_log(log: &Arc<Mutex<VecDeque<String>>>, line: String) {
         let mut l = log.lock().unwrap();
         l.push_back(line);
@@ -544,6 +562,46 @@ impl Runner {
     }
 }
 
+/// The system Trash, where deleted recordings go so they can be restored (macOS; elsewhere they are removed).
+fn trash_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") { Some(home().join(".Trash")).filter(|p| p.is_dir()) } else { None }
+}
+
+/// Moves a recording's folder to `trash` (or deletes it without one). Refuses anything that is not a real
+/// folder directly inside one of the macro folders, so a linked repository is never touched.
+fn remove_recording(
+    dir: &std::path::Path,
+    sources: &[PathBuf],
+    trash: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is a link, not a recording folder; remove it yourself", dir.display()));
+    }
+    let parent = dir.parent().and_then(|p| p.canonicalize().ok());
+    let inside = sources.iter().filter_map(|s| s.canonicalize().ok()).any(|s| Some(&s) == parent.as_ref());
+    if !inside {
+        return Err(format!("{} is not in a macro folder; remove it yourself", dir.display()));
+    }
+    match trash {
+        Some(trash) => {
+            let name = dir.file_name().ok_or("bad folder name")?;
+            let mut to = trash.join(name);
+            let mut n = 2;
+            while to.exists() {
+                to = trash.join(format!("{} {n}", name.to_string_lossy()));
+                n += 1;
+            }
+            std::fs::rename(dir, &to).map_err(|e| format!("cannot move to the Trash: {e}"))?;
+            Ok("moved to the Trash".into())
+        }
+        None => {
+            std::fs::remove_dir_all(dir).map_err(|e| format!("cannot delete: {e}"))?;
+            Ok("deleted".into())
+        }
+    }
+}
+
 /// Runs the macro command line through the system shell.
 #[cfg(unix)]
 pub(crate) fn shell_command(line: &str) -> Command {
@@ -588,6 +646,28 @@ mod tests {
             plan: Plan::default().merged(&serde_json::json!({"limit_min": 5, "after": after})).unwrap(),
         }];
         Runner::new(Ok(list), Vec::new(), 0)
+    }
+
+    #[test]
+    fn only_recording_folders_inside_the_macro_folder_are_removed() {
+        let base = std::env::temp_dir().join(format!("psconnector-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (macros, trash, repo) = (base.join("macros"), base.join("trash"), base.join("repo"));
+        for d in [macros.join("Run"), trash.clone(), repo.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::os::unix::fs::symlink(&repo, macros.join("linked")).unwrap();
+        let sources = vec![macros.clone()];
+        let err = remove_recording(&macros.join("linked"), &sources, Some(&trash)).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(repo.is_dir(), "a linked repository is never touched");
+        assert!(remove_recording(&repo, &sources, Some(&trash)).unwrap_err().contains("not in a macro folder"));
+        assert_eq!(remove_recording(&macros.join("Run"), &sources, Some(&trash)).unwrap(), "moved to the Trash");
+        assert!(!macros.join("Run").exists() && trash.join("Run").is_dir());
+        std::fs::create_dir_all(macros.join("Run")).unwrap();
+        remove_recording(&macros.join("Run"), &sources, Some(&trash)).unwrap();
+        assert!(trash.join("Run 2").is_dir(), "a second one with the same name is kept apart");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn wait_end(r: &mut Runner) -> Ended {

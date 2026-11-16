@@ -407,6 +407,9 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner, has_pad: bool) -> bool {
             });
             ui.separator();
             ui.label(theme::caption(ui, run_summary(&r.plan, recording)));
+            if recording {
+                delete_recording(ui, r);
+            }
             let last = match &r.macros {
                 Err(e) => e.clone(),
                 Ok(_) => r.last_exit.clone().map(|e| format!("Last run: {e}")).unwrap_or_default(),
@@ -741,6 +744,39 @@ impl Viewer {
         // Frames wake the window immediately; this slower tick is for OSD, connection state and controls.
         ctx.request_repaint_after(Duration::from_millis(100));
     }
+}
+
+/// Delete for a recording, with a second click to confirm.
+fn delete_recording(ui: &mut egui::Ui, r: &mut Runner) {
+    let t = theme::tokens(ui);
+    let id = ui.scope_id().with("delete_recording_confirm");
+    let name = r.macros.as_ref().ok().and_then(|l| l.get(r.selected)).map(|m| m.name.clone()).unwrap_or_default();
+    // the confirmation belongs to one macro: picking another one cancels it
+    let confirming = ui.data(|d| d.get_temp::<String>(id)).is_some_and(|n| n == name);
+    ui.separator();
+    if !confirming {
+        let b =
+            egui::Button::new(egui::RichText::new(format!("{}  Delete recording", icon::TRASH)).color(t.danger_text))
+                .frame_when_inactive(false);
+        if ui.add(b).clicked() {
+            ui.data_mut(|d| d.insert_temp(id, name));
+        }
+        return;
+    }
+    let where_to = if cfg!(target_os = "macos") { "It goes to the Trash." } else { "This cannot be undone." };
+    ui.label(theme::caption(ui, format!("Delete “{name}”? {where_to}")));
+    ui.horizontal(|ui| {
+        if theme::destructive(ui, true, "Delete").clicked() {
+            ui.data_mut(|d| d.remove::<String>(id));
+            match r.delete_selected() {
+                Ok(msg) => r.last_exit = Some(msg),
+                Err(e) => r.last_exit = Some(format!("Not deleted: {e}")),
+            }
+        }
+        if theme::ghost(ui, true, "Cancel").clicked() {
+            ui.data_mut(|d| d.remove::<String>(id));
+        }
+    });
 }
 
 /// What ▶ will do with these options, in one sentence.
