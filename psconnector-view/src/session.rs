@@ -21,6 +21,7 @@ pub(crate) struct Shared {
     pub(crate) osd: Mutex<String>,
     /// Name of the game controller connected to this computer, if any
     pub(crate) pad: Arc<Mutex<Option<String>>>,
+    pub(crate) recorder: Arc<record::Recorder>,
     /// Sound is playing (false with --no-audio or without an output device)
     pub(crate) sound: bool,
     pub(crate) muted: Arc<AtomicBool>,
@@ -175,6 +176,7 @@ pub(crate) fn start_session(
         runner: runner.clone(),
         osd: Mutex::new(String::new()),
         pad: out.pad.clone(),
+        recorder: out.recorder.clone(),
         sound: out.audio.is_some(),
         muted: out.muted.clone(),
         playing: AtomicBool::new(false),
@@ -206,6 +208,8 @@ pub(crate) fn start_session(
 /// Ends a session (Disconnect): stops its macro, frees the command port, and closes the connection.
 pub(crate) fn end_session(rt: &tokio::runtime::Handle, sh: &Arc<Shared>) {
     sh.runner.lock().unwrap().shutdown();
+    // a recording in progress is dropped with the connection it was recording
+    sh.recorder.stop();
     sh.stop_play.store(true, Ordering::SeqCst);
     sh.release_all();
     sh.ended.store(true, Ordering::SeqCst);

@@ -18,6 +18,14 @@ pub(crate) struct Viewer {
     pub(crate) preset_name: String,
     /// Time spent turning frames into the window texture, logged every 10 s
     pub(crate) upload: (u32, Duration, Option<Instant>),
+    /// A finished recording waiting for a name (Save / Discard in the bar)
+    pub(crate) rec_save: Option<RecSave>,
+}
+
+pub(crate) struct RecSave {
+    pub(crate) take: record::Take,
+    pub(crate) name: String,
+    pub(crate) error: Option<String>,
 }
 
 /// Frames shown per second, over the last second.
@@ -58,7 +66,13 @@ impl Viewer {
                 self.picture_open = !self.picture_open;
             }
             theme::vsep(ui);
-            macro_widget(ui, r);
+            if self.shared.recorder.recording() {
+                self.recording_widget(ui);
+            } else if self.rec_save.is_some() {
+                self.save_widget(ui, r);
+            } else if macro_widget(ui, r, self.shared.pad.lock().unwrap().is_some()) {
+                self.shared.recorder.start();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.more_menu(ui, r);
                 if self.shared.sound {
@@ -103,6 +117,88 @@ impl Viewer {
         });
         if chosen != current {
             let _ = self.shared.set_quality(chosen);
+        }
+    }
+
+    /// While recording: time, checkpoints, a Checkpoint button (or C) and Stop.
+    fn recording_widget(&mut self, ui: &mut egui::Ui) {
+        let t = theme::tokens(ui);
+        let (secs, checkpoints, inputs) = self.shared.recorder.progress().unwrap_or_default();
+        let info = format!(
+            "{} · {checkpoints} checkpoint{} · {inputs} inputs",
+            hms(Duration::from_secs_f64(secs)),
+            if checkpoints == 1 { "" } else { "s" }
+        );
+        let (mark, stop) = state_strip(ui, t.danger_soft, t.danger, |ui| {
+            theme::status_dot(ui, t.danger);
+            ui.label("Recording");
+            ui.label(egui::RichText::new(info).color(t.muted));
+            let mark = ui
+                .add(
+                    egui::Button::new(format!("{}  Checkpoint", icon::FLAG))
+                        .frame_when_inactive(false)
+                        .min_size(egui::vec2(0.0, theme::size::CONTROL)),
+                )
+                .on_hover_text(
+                    "Press when the screen shows something the replay should wait for (a menu, the end of a \
+                     load, a place). The replay waits here until the screen looks like this again. Key: C",
+                )
+                .clicked();
+            (mark, end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop recording").clicked())
+        });
+        if mark && let Some(f) = self.shared.client().frame() {
+            self.shared.recorder.checkpoint(&f);
+        }
+        if stop {
+            self.stop_recording();
+        }
+    }
+
+    pub(crate) fn stop_recording(&mut self) {
+        if let Some(take) = self.shared.recorder.stop() {
+            let name = format!("Recording {}", chrono::Local::now().format("%m-%d %H:%M"));
+            self.rec_save = Some(RecSave { take, name, error: None });
+        }
+    }
+
+    /// After recording: name it, Save or Discard (how often it repeats is set in the macro options).
+    fn save_widget(&mut self, ui: &mut egui::Ui, r: &mut Runner) {
+        let Some(s) = self.rec_save.as_mut() else { return };
+        let t = theme::tokens(ui);
+        let mut save = false;
+        let mut discard = false;
+        ui.label(egui::RichText::new(icon::RECORD).color(t.danger));
+        let resp = ui.add(theme::field(&mut s.name, theme::size::CONTROL).desired_width(170.0));
+        save |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        save |= theme::primary(ui, true, &format!("{}  Save", icon::SAVE)).clicked();
+        discard |= theme::ghost(ui, true, "Discard").clicked();
+        let summary = format!(
+            "{} · {} checkpoints · {} inputs",
+            hms(Duration::from_secs_f64(s.take.duration())),
+            s.take.checkpoints(),
+            s.take.inputs()
+        );
+        ui.label(theme::caption(ui, s.error.clone().unwrap_or(summary)));
+        if discard {
+            self.rec_save = None;
+        } else if save {
+            let folder = r.sources.iter().find(|p| p.is_dir()).cloned();
+            let result = match folder {
+                Some(dir) => record::save(&s.take, &dir, &s.name).map_err(|e| format!("{e:#}")),
+                None => Err("no macro folder to save into".to_string()),
+            };
+            match result {
+                Ok(dir) => {
+                    log::info!("recording saved to {}", dir.display());
+                    let name = s.name.trim().to_string();
+                    r.reload();
+                    if let Ok(i) = r.find(&name) {
+                        r.select(i);
+                    }
+                    self.rec_save = None;
+                }
+                Err(e) => s.error = Some(e),
+            }
         }
     }
 
@@ -179,8 +275,8 @@ fn state_strip<R>(
 }
 
 /// One widget for macros, like an IDE's run widget: what it shows depends on whether a macro is running,
-/// scheduled or idle, so the three never compete for space.
-fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
+/// scheduled or idle, so the three never compete for space. Returns true when Record was pressed.
+fn macro_widget(ui: &mut egui::Ui, r: &mut Runner, has_pad: bool) -> bool {
     let t = theme::tokens(ui);
     let names: Vec<String> = match &r.macros {
         Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
@@ -212,7 +308,7 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
         let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
         ui.add_space(6.0);
         ui.add(egui::Label::new(egui::RichText::new(last).size(theme::size::CAPTION).color(t.faint)).truncate());
-        return;
+        return false;
     }
     if let Some(sc) = &r.scheduled {
         let name = names.get(sc.index).cloned().unwrap_or_default();
@@ -231,7 +327,7 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
         if cancel {
             r.cancel_schedule();
         }
-        return;
+        return false;
     }
     let has = !names.is_empty();
     ui.horizontal(|ui| {
@@ -268,48 +364,64 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
     let options = egui::containers::menu::MenuButton::from_button(button).config(
         egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
     );
-    let (resp, _) = options.ui(ui, |ui| {
-        ui.set_min_width(260.0);
-        theme::section_label(ui, "Macro options");
-        egui::Grid::new("macro_options").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-            ui.label("Time limit");
-            ui.add(
-                egui::DragValue::new(&mut r.plan.limit_min)
-                    .range(0..=24 * 60)
-                    .custom_formatter(|v, _| if v < 1.0 { "no limit".into() } else { format!("{v:.0} min") }),
-            )
-            .on_hover_text(
-                "Drag or type, 0 = no limit. When it is reached, a macro that checks ps.should_stop() gets \
-                 2 minutes to finish; others are stopped right away.",
-            );
-            ui.end_row();
-            ui.label("When done");
-            theme::segmented(ui, &mut r.plan.after, &[(After::Nothing, "Nothing"), (After::Standby, "Rest mode")]);
-            ui.end_row();
-            ui.label("Start at");
-            ui.horizontal(|ui| {
-                ui.add(theme::field(&mut r.at_text, theme::size::CONTROL).hint_text("HH:MM").desired_width(64.0))
-                    .on_hover_text("HH:MM (today, or tomorrow if already past) or +MINUTES");
-                let can = has && !r.at_text.trim().is_empty();
-                if ui.add_enabled(can, egui::Button::new(format!("{}  Schedule", icon::CLOCK))).clicked() {
-                    r.schedule_selected();
-                    ui.close();
+    let recording = r.macros.as_ref().ok().and_then(|l| l.get(r.selected)).is_some_and(|m| m.recording.is_some());
+    let (resp, _) =
+        options.ui(ui, |ui| {
+            ui.set_min_width(280.0);
+            theme::section_label(ui, "Macro options");
+            egui::Grid::new("macro_options").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                if recording {
+                    ui.label("Repeat");
+                    ui.add(egui::DragValue::new(&mut r.plan.repeat).range(0..=100_000).speed(0.2).custom_formatter(
+                        |v, _| if v < 1.0 { "until stopped".into() } else { format!("{v:.0} times") },
+                    ))
+                    .on_hover_text("How many times the recording plays. Drag or type; 0 = until you stop it");
+                    ui.end_row();
                 }
+                ui.label("Stop after");
+                ui.add(
+                    egui::DragValue::new(&mut r.plan.limit_min)
+                        .range(0..=24 * 60)
+                        .custom_formatter(|v, _| if v < 1.0 { "never".into() } else { format!("{v:.0} minutes") }),
+                )
+                .on_hover_text(
+                    "A time limit in minutes. Drag or type; 0 = never. When it is reached, a macro that checks \
+                 ps.should_stop() (recordings do, after each lap) gets 2 minutes to finish; others are stopped \
+                 right away.",
+                );
+                ui.end_row();
+                ui.label("When done");
+                theme::segmented(ui, &mut r.plan.after, &[(After::Nothing, "Nothing"), (After::Standby, "Rest mode")]);
+                ui.end_row();
+                ui.label("Start at");
+                ui.horizontal(|ui| {
+                    ui.add(theme::field(&mut r.at_text, theme::size::CONTROL).hint_text("HH:MM").desired_width(64.0))
+                        .on_hover_text("HH:MM (today, or tomorrow if already past) or +MINUTES");
+                    let can = has && !r.at_text.trim().is_empty();
+                    if ui.add_enabled(can, egui::Button::new(format!("{}  Schedule", icon::CLOCK))).clicked() {
+                        r.schedule_selected();
+                        ui.close();
+                    }
+                });
+                ui.end_row();
             });
-            ui.end_row();
-        });
-        let last = match &r.macros {
-            Err(e) => e.clone(),
-            Ok(_) => r.last_exit.clone().map(|e| format!("Last run: {e}")).unwrap_or_default(),
-        };
-        if !last.is_empty() {
             ui.separator();
-            ui.label(theme::caption(ui, last));
-        }
-    });
-    resp.on_hover_text("Time limit, what to do afterwards, start time");
+            ui.label(theme::caption(ui, run_summary(&r.plan, recording)));
+            let last = match &r.macros {
+                Err(e) => e.clone(),
+                Ok(_) => r.last_exit.clone().map(|e| format!("Last run: {e}")).unwrap_or_default(),
+            };
+            if !last.is_empty() {
+                ui.separator();
+                ui.label(theme::caption(ui, last));
+            }
+        });
+    resp.on_hover_text("Repeat, time limit, what to do afterwards, start time");
     // the settings that change what ▶ does stay visible without opening the menu
     let mut summary = Vec::new();
+    if recording {
+        summary.push(if r.plan.repeat == 0 { "∞".to_string() } else { format!("{}×", r.plan.repeat) });
+    }
     if r.plan.limit_min > 0 {
         summary.push(format!("{} min", r.plan.limit_min));
     }
@@ -317,8 +429,22 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner) {
         summary.push("then rest".into());
     }
     if !summary.is_empty() {
-        ui.label(theme::caption(ui, summary.join(" · ")));
+        ui.label(theme::caption(ui, summary.join(" · "))).on_hover_text(run_summary(&r.plan, recording));
     }
+    theme::vsep(ui);
+    let rec = ui
+        .add_enabled(
+            has_pad,
+            egui::Button::new(format!("{}  Record", icon::RECORD))
+                .frame_when_inactive(false)
+                .min_size(egui::vec2(0.0, theme::size::CONTROL)),
+        )
+        .on_hover_text(
+            "Record what you do with the controller as a new macro. Mark checkpoints while recording (C) \
+             where the replay should wait for the screen.",
+        )
+        .on_disabled_hover_text("Connect a controller to this computer to record");
+    rec.clicked()
 }
 
 impl Viewer {
@@ -374,19 +500,8 @@ impl Viewer {
         let t = theme::tokens(ui);
         let mut p = *self.shared.picture.lock().unwrap();
         let before = p;
-        let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(16));
-        egui::Panel::right("picture").exact_size(320.0).resizable(false).frame(frame).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Picture").strong().size(theme::size::TITLE));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::icon_button(ui, icon::CLOSE, "Close").clicked() {
-                        self.picture_open = false;
-                    }
-                });
-            });
-            ui.label(theme::caption(ui, "Changes only what you see here; macros and screenshots get the original."));
-            ui.add_space(8.0);
-
+        let description = "Changes only what you see here; macros and screenshots get the original.";
+        let closed = theme::side_panel(ui, "picture", 320.0, "Picture", Some(description), |ui| {
             let current_range = *self.shared.video_range.lock().unwrap();
             let presets = Self::picture_presets();
             let current = presets
@@ -497,6 +612,9 @@ impl Viewer {
                 }
             }
         });
+        if closed {
+            self.picture_open = false;
+        }
         if p != before {
             self.shared.set_picture(p);
         }
@@ -505,7 +623,15 @@ impl Viewer {
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let quit = QUIT.load(Ordering::SeqCst);
-        if quit || ctx.input(|i| i.key_pressed(egui::Key::Q) && !i.modifiers.any()) {
+        let typing = ctx.egui_wants_keyboard_input();
+        if self.shared.recorder.recording()
+            && !typing
+            && ctx.input(|i| i.key_pressed(egui::Key::C) && !i.modifiers.any())
+            && let Some(f) = self.shared.client().frame()
+        {
+            self.shared.recorder.checkpoint(&f);
+        }
+        if quit || (!typing && ctx.input(|i| i.key_pressed(egui::Key::Q) && !i.modifiers.any())) {
             self.runner.lock().unwrap().shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -614,5 +740,46 @@ impl Viewer {
         }
         // Frames wake the window immediately; this slower tick is for OSD, connection state and controls.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+/// What ▶ will do with these options, in one sentence.
+fn run_summary(plan: &Plan, recording: bool) -> String {
+    let what = match (recording, plan.repeat) {
+        (false, _) => "Runs the macro".to_string(),
+        (true, 0) => "Plays the recording over and over".to_string(),
+        (true, 1) => "Plays the recording once".to_string(),
+        (true, n) => format!("Plays the recording {n} times"),
+    };
+    let until = match (recording && plan.repeat > 0, plan.limit_min) {
+        (_, 0) if recording && plan.repeat == 0 => " until you stop it".to_string(),
+        (_, 0) => String::new(),
+        (true, m) => format!(", or stops after {m} minutes if that comes first"),
+        (false, m) => format!(" for at most {m} minutes"),
+    };
+    let after = if plan.after == After::Standby { ", then puts the PS5 in rest mode" } else { "" };
+    format!("{what}{until}{after}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_summary_says_what_play_will_do() {
+        let plan = |repeat, limit_min, after| Plan { repeat, limit_min, after };
+        assert_eq!(
+            run_summary(&plan(0, 0, After::Nothing), true),
+            "Plays the recording over and over until you stop it."
+        );
+        assert_eq!(
+            run_summary(&plan(5, 30, After::Standby), true),
+            "Plays the recording 5 times, or stops after 30 minutes if that comes first, then puts the PS5 in rest mode."
+        );
+        assert_eq!(
+            run_summary(&plan(0, 45, After::Nothing), true),
+            "Plays the recording over and over for at most 45 minutes."
+        );
+        assert_eq!(run_summary(&plan(0, 0, After::Nothing), false), "Runs the macro.");
     }
 }

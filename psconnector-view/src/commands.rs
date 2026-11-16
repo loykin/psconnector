@@ -55,6 +55,20 @@ pub(crate) async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
         let mut out = format!("ok {} {} {}\n", f.width, f.height, f.rgb().len()).into_bytes();
         out.extend_from_slice(f.rgb());
         return Ok(Reply::Bytes(out));
+    } else if let Some(region) = m.get("thumb") {
+        // {"thumb": [x0, y0, x1, y1]} (fractions; [] or true = whole frame): the screen at checkpoint size
+        let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;
+        let v: Vec<f64> = region.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        let region = match v.as_slice() {
+            [x0, y0, x1, y1] => [*x0, *y0, *x1, *y1],
+            [] => record::FULL,
+            _ => bail!("thumb region must be [x0, y0, x1, y1] fractions"),
+        };
+        let rgb = tokio::task::spawn_blocking(move || record::downscale(&f, region, record::THUMB)).await?;
+        let (w, h) = record::THUMB;
+        let mut out = format!("ok {w} {h} {}\n", rgb.len()).into_bytes();
+        out.extend_from_slice(&rgb);
+        return Ok(Reply::Bytes(out));
     } else if let Some(region) = m.get("ocr") {
         // {"ocr": [x, y, w, h], "scale": 2.0} → ok ["line", ...]
         let f = c.frame().ok_or_else(|| anyhow!("no frame yet"))?;

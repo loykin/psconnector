@@ -18,7 +18,8 @@
 //!
 //! Commands: `{"button":"cross","action":"tap|press|release","hold":0.08}` `{"stick":"left","x":0,"y":-1}`
 //! `{"release_all":true}` `{"snap":"path.png"}` `{"screen_snap":"path.png"}` `{"frame":true}`
-//! `{"play":"recording.json"}` `{"stop":true}`
+//! `{"play":"recording.json"}` `{"stop":true}` `{"thumb":[x0,y0,x1,y1]}` (the screen at checkpoint size: reply
+//! `ok WIDTH HEIGHT BYTES` and the RGB bytes, like `frame`)
 //! `{"status":true}` `{"osd":"text"}` `{"standby":true}` `{"ocr":[x,y,w,h],"scale":2}` (reply `ok ["line", ...]`)
 //! Macros: `{"macros":true}` `{"macro_run":"name","limit_min":60,"after":"standby","at":"23:00"}` (all but the name
 //! optional) `{"macro_stop":true}` (also cancels a schedule) `{"macro_status":true,"lines":10}` (reply `ok {JSON}`)
@@ -55,6 +56,8 @@ mod ocr;
 mod pad;
 mod picture;
 mod quality;
+mod record;
+mod replay;
 mod session;
 mod settings;
 mod setup;
@@ -96,6 +99,14 @@ fn expand(p: &str) -> PathBuf {
 fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--login-window") {
         login_window::run();
+    }
+    if std::env::args().nth(1).as_deref() == Some("--replay") {
+        let path = std::env::args().nth(2).unwrap_or_else(|| "recording.json".into());
+        let repeat = match std::env::args().nth(3).as_deref() {
+            Some("--repeat") => std::env::args().nth(4).and_then(|n| n.parse().ok()),
+            _ => None,
+        };
+        replay::run(std::path::Path::new(&path), repeat);
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut args = std::env::args().skip(1);
@@ -198,10 +209,19 @@ fn main() -> Result<()> {
     let muted = Arc::new(AtomicBool::new(launch.start_muted));
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     let sound = launch.use_audio && sound::spawn(audio_rx, muted.clone());
-    let outputs = Outputs { audio: sound.then_some(audio_tx), muted, pad: Arc::new(Mutex::new(None)) };
+    let outputs = Outputs {
+        audio: sound.then_some(audio_tx),
+        muted,
+        pad: Arc::new(Mutex::new(None)),
+        recorder: Arc::new(record::Recorder::default()),
+    };
     if launch.use_pad {
         let current = session.clone();
-        pad::spawn(move || current.lock().unwrap().as_ref().map(|s| s.client()), outputs.pad.clone());
+        pad::spawn(
+            move || current.lock().unwrap().as_ref().map(|s| s.client()),
+            outputs.pad.clone(),
+            outputs.recorder.clone(),
+        );
     }
     let app_session = session.clone();
     let handle = rt.handle().clone();
@@ -302,6 +322,8 @@ struct Outputs {
     audio: Option<std::sync::mpsc::Sender<Audio>>,
     muted: Arc<AtomicBool>,
     pad: Arc<Mutex<Option<String>>>,
+    /// Records what the local pad sends (Record in the bar)
+    recorder: Arc<record::Recorder>,
 }
 
 enum State {
@@ -354,6 +376,7 @@ impl eframe::App for App {
                                 picture_open: false,
                                 preset_name: String::new(),
                                 upload: (0, Duration::ZERO, None),
+                                rec_save: None,
                             }));
                         }
                         Err(e) => {

@@ -2,6 +2,7 @@
 //! official Remote Play app. Runs on its own thread; input goes to the same send queue as macro input.
 //!
 //! Sticks are only sent when they move, so an idle pad does not override a macro's stick commands.
+//! While Record is on, everything sent is also handed to the recorder.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -108,7 +109,11 @@ impl Sticks {
 /// Starts the controller thread. `name` holds the connected pad's name for the window.
 /// `client` gives the current connection (it changes when the viewer reconnects; None = not connected,
 /// input is dropped). Runs for the whole program.
-pub fn spawn(client: impl Fn() -> Option<Arc<Client>> + Send + 'static, name: Arc<Mutex<Option<String>>>) {
+pub fn spawn(
+    client: impl Fn() -> Option<Arc<Client>> + Send + 'static,
+    name: Arc<Mutex<Option<String>>>,
+    recorder: Arc<crate::record::Recorder>,
+) {
     std::thread::spawn(move || {
         let mut gilrs = match Gilrs::new() {
             Ok(g) => g,
@@ -142,11 +147,13 @@ pub fn spawn(client: impl Fn() -> Option<Arc<Client>> + Send + 'static, name: Ar
                 EventType::ButtonPressed(b, _) => {
                     if let (Some(b), Some(c)) = (map(b), client()) {
                         c.press(b);
+                        recorder.button(b, true);
                     }
                 }
                 EventType::ButtonReleased(b, _) => {
                     if let (Some(b), Some(c)) = (map(b), client()) {
                         c.release(b);
+                        recorder.button(b, false);
                     }
                 }
                 EventType::AxisChanged(axis, v, _) => {
@@ -155,6 +162,7 @@ pub fn spawn(client: impl Fn() -> Option<Arc<Client>> + Send + 'static, name: Ar
                         && let Some(c) = client()
                     {
                         c.stick(right, x, y);
+                        recorder.stick(right, x, y);
                     }
                 }
                 EventType::Connected => update_name(&gilrs),

@@ -45,10 +45,12 @@ pub(crate) struct Plan {
     /// 0 = no limit
     pub(crate) limit_min: u32,
     pub(crate) after: After,
+    /// Recordings only: how many times one run plays it (0 = until stopped or the time limit)
+    pub(crate) repeat: u32,
 }
 
 impl Plan {
-    /// Reads `limit_min` and `after` from a JSON object, keeping `self` for missing fields.
+    /// Reads `limit_min`, `after` and `repeat` from a JSON object, keeping `self` for missing fields.
     pub(crate) fn merged(self, v: &Value) -> Result<Self, String> {
         let limit_min = match &v["limit_min"] {
             Value::Null => self.limit_min,
@@ -58,7 +60,11 @@ impl Plan {
             None => self.after,
             Some(s) => After::parse(s).ok_or_else(|| format!("after must be none or standby, not '{s}'"))?,
         };
-        Ok(Self { limit_min, after })
+        let repeat = match &v["repeat"] {
+            Value::Null => self.repeat,
+            n => n.as_u64().ok_or("repeat must be a whole number (0 = until stopped)")? as u32,
+        };
+        Ok(Self { limit_min, after, repeat })
     }
 }
 
@@ -68,6 +74,8 @@ pub(crate) struct MacroDef {
     pub(crate) cmd: String,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
+    /// A recording made with Record (`"recording"` instead of `"cmd"`), replayed by this program
+    pub(crate) recording: Option<PathBuf>,
     /// Default limit and after-action from the list
     pub(crate) plan: Plan,
 }
@@ -137,7 +145,18 @@ pub(crate) fn load_macros(sources: &[PathBuf]) -> Result<Vec<MacroDef>, String> 
 
 /// One macro from its JSON. `folder` gives the default name and working folder (folder macros).
 pub(crate) fn macro_def(m: &Value, folder_name: Option<&str>, folder: Option<&PathBuf>) -> Result<MacroDef, String> {
-    let cmd = m["cmd"].as_str().ok_or("\"cmd\" is missing")?.to_string();
+    let recording = m["recording"].as_str().map(|r| {
+        let p = expand(r);
+        match folder {
+            Some(f) if p.is_relative() => f.join(p),
+            _ => p,
+        }
+    });
+    let cmd = match (m["cmd"].as_str(), &recording) {
+        (Some(c), _) => c.to_string(),
+        (None, Some(r)) => format!("(recording {})", r.display()),
+        (None, None) => return Err("\"cmd\" is missing".into()),
+    };
     let name = m["name"].as_str().or(folder_name).ok_or("\"name\" is missing")?.to_string();
     let cwd = match m["cwd"].as_str() {
         Some(c) => {
@@ -151,6 +170,7 @@ pub(crate) fn macro_def(m: &Value, folder_name: Option<&str>, folder: Option<&Pa
     };
     Ok(MacroDef {
         cmd,
+        recording,
         cwd,
         env: m["env"]
             .as_object()
@@ -283,7 +303,15 @@ impl Runner {
     pub(crate) fn start_with(&mut self, index: usize, plan: Plan) {
         let Ok(list) = &self.macros else { return };
         let Some(m) = list.get(index).cloned() else { return };
-        let mut cmd = shell_command(&m.cmd);
+        let mut cmd = match &m.recording {
+            // a recording is replayed by this same program, as its own process like any macro
+            Some(rec) => {
+                let mut c = Command::new(std::env::current_exe().unwrap_or_else(|_| "psconnector-view".into()));
+                c.arg("--replay").arg(rec).arg("--repeat").arg(plan.repeat.to_string());
+                c
+            }
+            None => shell_command(&m.cmd),
+        };
         cmd.env("PSCONNECTOR_PORT", self.port.to_string())
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
@@ -313,12 +341,17 @@ impl Runner {
                     });
                 }
                 let limit = (plan.limit_min > 0).then(|| Duration::from_secs(u64::from(plan.limit_min) * 60));
+                let laps = match (&m.recording, plan.repeat) {
+                    (None, _) => String::new(),
+                    (Some(_), 0) => ", until stopped".into(),
+                    (Some(_), n) => format!(", {n}×"),
+                };
                 let note = match limit {
                     Some(_) => format!(" for {} min, {}", plan.limit_min, plan.after.label()),
                     None if plan.after == After::Standby => format!(", {}", plan.after.label()),
                     None => String::new(),
                 };
-                Self::push_log(&self.log, format!("▶ {} started{note}", m.name));
+                Self::push_log(&self.log, format!("▶ {} started{laps}{note}", m.name));
                 self.last_exit = None;
                 let started = Instant::now();
                 self.running = Some(Running {
@@ -549,6 +582,7 @@ mod tests {
         let list = vec![MacroDef {
             name: "test macro".into(),
             cmd: cmd.into(),
+            recording: None,
             cwd: None,
             env: Vec::new(),
             plan: Plan::default().merged(&serde_json::json!({"limit_min": 5, "after": after})).unwrap(),

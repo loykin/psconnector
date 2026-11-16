@@ -18,6 +18,8 @@ Each folder here is one macro for the psconnector-view bar. A folder needs a `ma
 | `name` | Name in the bar. Defaults to the folder name |
 | `cwd` | Run somewhere else instead (relative to the macro's folder) |
 | `env` | Extra environment variables |
+| `recording` | Instead of `cmd`: a recording made with **Record** in the bar (`recording.json`), played by psconnector-view itself |
+| `repeat` | Recordings only: how many times one run plays it (0 = until stopped, the default for new recordings) |
 | `limit_min`, `after` | Default run time limit (0 = none) and what to do afterwards (`none` / `standby`) |
 
 psconnector-view reads the `macros` folder next to the program (in a development build, this folder in the

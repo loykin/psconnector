@@ -26,6 +26,8 @@ pub mod icon {
     pub const CONSOLE: &str = "\u{EAE6}";
     pub const TRASH: &str = "\u{E4A6}";
     pub const SAVE: &str = "\u{E248}";
+    pub const RECORD: &str = "\u{E3EE}";
+    pub const FLAG: &str = "\u{E244}";
 }
 
 /// Embeds the icon font and puts it after the text font, so icons can be mixed into any label.
@@ -122,6 +124,12 @@ pub mod size {
     pub const BODY: f32 = 13.0;
     pub const TITLE: f32 = 15.0;
     pub const HEADING: f32 = 20.0;
+    /// padding inside side panels and cards
+    pub const PANEL_PAD: i8 = 16;
+    /// scroll bars: a thin bar in its own gutter, never over the content
+    pub const SCROLL_BAR: f32 = 6.0;
+    /// space between the content and the scroll bar
+    pub const SCROLL_GAP: f32 = 4.0;
 }
 
 pub fn tokens(ui: &Ui) -> &'static Tokens {
@@ -176,6 +184,24 @@ pub fn apply(ctx: &egui::Context) {
             s.spacing.button_padding = egui::vec2(10.0, 4.0);
             s.spacing.interact_size.y = size::CONTROL;
             s.spacing.menu_margin = Margin::same(6);
+            // A thin bar at the very edge that does not widen on hover. Panels keep a gutter for it
+            // (see `side_panel`), so it never covers sliders or buttons at the right edge.
+            s.spacing.scroll = egui::style::ScrollStyle {
+                bar_width: size::SCROLL_BAR,
+                floating_width: size::SCROLL_BAR,
+                floating_allocated_width: 0.0,
+                handle_min_length: 24.0,
+                bar_inner_margin: 0.0,
+                bar_outer_margin: 0.0,
+                // the handle stays faintly visible, so it is clear the panel scrolls
+                dormant_background_opacity: 0.0,
+                dormant_handle_opacity: 0.35,
+                active_background_opacity: 0.25,
+                active_handle_opacity: 0.6,
+                interact_background_opacity: 0.4,
+                interact_handle_opacity: 0.9,
+                ..egui::style::ScrollStyle::floating()
+            };
             for (style, px) in [
                 (egui::TextStyle::Body, size::BODY),
                 (egui::TextStyle::Button, size::BODY),
@@ -361,6 +387,48 @@ pub fn vsep(ui: &mut Ui) {
 }
 
 /// A bordered panel with a title, used for the groups of the start screen.
+/// A side panel: fixed title row with a close button, then content that scrolls when the window is short.
+/// The panel's right padding holds the scroll bar, so the content and the title end at the same edge
+/// whether or not it scrolls. Returns true when the close button was pressed.
+pub fn side_panel(
+    ui: &mut Ui,
+    id: &str,
+    width: f32,
+    title: &str,
+    description: Option<&str>,
+    body: impl FnOnce(&mut Ui),
+) -> bool {
+    let t = tokens(ui);
+    let pad = size::PANEL_PAD;
+    let gutter = (size::SCROLL_BAR + size::SCROLL_GAP) as i8;
+    let frame = egui::Frame::new().fill(t.surface).inner_margin(Margin {
+        left: pad,
+        right: pad - gutter,
+        top: pad,
+        bottom: pad,
+    });
+    let mut closed = false;
+    egui::Panel::right(id.to_string()).exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
+        egui::Frame::new().inner_margin(Margin { right: gutter, ..Margin::ZERO }).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).strong().size(size::TITLE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    closed = icon_button(ui, icon::CLOSE, "Close").clicked();
+                });
+            });
+            if let Some(d) = description {
+                ui.label(caption(ui, d));
+            }
+        });
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // the gutter is kept whether or not the bar shows, so the right edge never moves
+            egui::Frame::new().inner_margin(Margin { right: gutter, ..Margin::ZERO }).show(ui, body);
+        });
+    });
+    closed
+}
+
 pub fn card<R>(ui: &mut Ui, title: &str, description: Option<&str>, body: impl FnOnce(&mut Ui) -> R) -> R {
     let t = tokens(ui);
     egui::Frame::new()
