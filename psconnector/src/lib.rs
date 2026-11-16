@@ -131,9 +131,8 @@ impl Client {
             None => profile::load_any(opts.user.as_deref(), host_id)?,
         };
 
-        #[cfg(not(target_os = "macos"))]
-        if opts.video_codec != VideoCodec::H264 {
-            return Err(Error::Unsupported("H.265 decoding is currently available on macOS only".into()));
+        if opts.video_codec != VideoCodec::H264 && !video::HEVC_AVAILABLE {
+            return Err(Error::Unsupported("H.265 decoding is not available on this platform".into()));
         }
         let started = session::start(host, &reg, opts.video_codec).await?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

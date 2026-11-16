@@ -68,7 +68,11 @@ impl Session {
                 cv::pixel_buffer_keys::metal_compatibility(),
                 cv::pixel_buffer_keys::io_surf_props(),
             ],
-            &[pixel_format.to_cf_number().as_type_ref(), cf::Boolean::value_true().as_type_ref(), surface_props.as_type_ref()],
+            &[
+                pixel_format.to_cf_number().as_type_ref(),
+                cf::Boolean::value_true().as_type_ref(),
+                surface_props.as_type_ref(),
+            ],
         );
         let record = vt::DecompressionOutputCbRecord::new(shared, Some(output_callback));
         match vt::DecompressionSession::new(&format, None, Some(&attrs), Some(&record)) {
@@ -85,8 +89,11 @@ impl Session {
     fn decode(&self, packed: &[u8]) -> Result<PixelBuf, String> {
         let mut block = cm::BlockBuf::with_mem_block(packed.len()).map_err(|e| format!("block buffer: {e:?}"))?;
         block.as_mut_slice().map_err(|e| format!("block buffer: {e:?}"))?.copy_from_slice(packed);
-        let timing =
-            cm::SampleTimingInfo { duration: cm::Time::new(1, 60), pts: cm::Time::new(0, 60), dts: cm::Time::invalid() };
+        let timing = cm::SampleTimingInfo {
+            duration: cm::Time::new(1, 60),
+            pts: cm::Time::new(0, 60),
+            dts: cm::Time::invalid(),
+        };
         let sizes = [packed.len()];
         let mut sample = None;
         // SAFETY: everything passed lives for the call; the counts (1) match the one-element arrays.

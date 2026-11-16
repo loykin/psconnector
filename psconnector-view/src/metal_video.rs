@@ -58,7 +58,7 @@ impl MetalFrames {
     /// The frame's planes as wgpu textures (Y and CbCr for NV12, one BGRA texture otherwise), or None for
     /// a frame without a native buffer.
     pub(crate) fn textures(&mut self, device: &wgpu::Device, frame: &Arc<Frame>) -> Option<Vec<wgpu::Texture>> {
-        let pb = frame.cv_pixel_buffer()?;
+        let pb = frame.native_buffer()?;
         // SAFETY: the frame owns the pixel buffer and outlives this borrow.
         let pb: &cv::PixelBuf = unsafe { &*(pb as *const cv::PixelBuf) };
         let (w, h) = (pb.width(), pb.height());

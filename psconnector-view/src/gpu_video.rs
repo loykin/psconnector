@@ -169,8 +169,8 @@ struct Resources {
     unused_planes: [wgpu::TextureView; 2],
     /// whether the bind group points at a frame's textures (rebuilt for the buffer when not)
     bound_textures: bool,
-    #[cfg(target_os = "macos")]
-    metal: Option<crate::metal_video::MetalFrames>,
+    /// draws the decoder's own buffers without a copy, where the platform allows
+    native: Option<crate::native_frames::NativeFrames>,
     present_pipeline: wgpu::RenderPipeline,
     present_layout: wgpu::BindGroupLayout,
     present_params: wgpu::Buffer,
@@ -378,11 +378,9 @@ impl Resources {
             [tiny_texture(device, wgpu::TextureFormat::R8Unorm), tiny_texture(device, wgpu::TextureFormat::Rg8Unorm)];
         let planes = [&unused_planes[0], &unused_planes[1]];
         let bind_group = Self::bind_group(device, &layout, &rgb, &lut, &params, &hdr_curve, planes);
-        #[cfg(target_os = "macos")]
-        let metal = crate::metal_video::MetalFrames::new(device);
-        #[cfg(target_os = "macos")]
-        if metal.is_some() {
-            log::info!("video frames: zero-copy (decoder buffers drawn as Metal textures)");
+        let native = crate::native_frames::NativeFrames::new(device);
+        if native.is_some() {
+            log::info!("video frames: {}", crate::native_frames::KIND);
         }
         Self {
             pipeline,
@@ -396,8 +394,7 @@ impl Resources {
             picture_version: None,
             unused_planes,
             bound_textures: false,
-            #[cfg(target_os = "macos")]
-            metal,
+            native,
             present_pipeline,
             present_layout,
             present_params,
@@ -493,9 +490,8 @@ impl Resources {
     }
 
     /// Binds a native frame's planes directly. False when the frame has none or they cannot be wrapped.
-    #[cfg(target_os = "macos")]
     fn bind_native(&mut self, device: &wgpu::Device, frame: &Arc<Frame>) -> bool {
-        let Some(textures) = self.metal.as_mut().and_then(|m| m.textures(device, frame)) else { return false };
+        let Some(textures) = self.native.as_mut().and_then(|m| m.textures(device, frame)) else { return false };
         let views: Vec<wgpu::TextureView> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
         let second = views.get(1).unwrap_or(&self.unused_planes[1]).clone();
         let first = views[0].clone();
@@ -505,10 +501,7 @@ impl Resources {
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pending: &Pending, target_is_srgb: bool) {
         let frame = &pending.frame;
-        #[cfg(target_os = "macos")]
         let native = self.bind_native(device, frame);
-        #[cfg(not(target_os = "macos"))]
-        let native = false;
         let mut format = match frame.format {
             psconnector::PixelFormat::Rgb8 => 0,
             psconnector::PixelFormat::Bgra8 => 1,

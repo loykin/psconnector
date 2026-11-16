@@ -24,16 +24,20 @@ use crate::VideoCodec;
 
 mod fec;
 mod h264;
+// H.265 and VideoToolbox are macOS-only; everything else reaches them through `hw`
+#[cfg(target_os = "macos")]
 mod hevc;
+mod hw;
 mod packet;
 #[cfg(target_os = "macos")]
 mod vt;
 
 #[allow(unused_imports)]
 use h264::*;
-#[allow(unused_imports)]
-use hevc::*;
 pub use packet::*;
+
+/// Whether this platform can decode the H.265 stream (else only H.264 is requested).
+pub(crate) const HEVC_AVAILABLE: bool = hw::HEVC;
 
 /// How a frame's pixels are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,21 +49,9 @@ pub enum PixelFormat {
     /// BGRA from an HDR stream, display-referred: [`hdr_sdr_curve`] and a small chroma restore turn it into SDR
     BgraHdr8,
     /// 8-bit YUV 4:2:0, a Y plane and an interleaved CbCr plane (hardware H.264). Only in a native frame
-    /// ([`Frame::cv_pixel_buffer`]); `full_range` and `bt709` say how to turn it into RGB.
+    /// ([`Frame::native_buffer`]); `full_range` and `bt709` say how to turn it into RGB.
     Nv12 { full_range: bool, bt709: bool },
 }
-
-/// A decoder's own pixel buffer (macOS: an IOSurface-backed CVPixelBuffer).
-#[cfg(target_os = "macos")]
-#[derive(Clone)]
-pub(crate) struct Native(pub(crate) vt::PixelBuf);
-
-// SAFETY: a CVPixelBuffer is reference counted atomically; the decoder no longer writes to it once it
-// has handed it over, and it is only read (locked read-only) afterwards.
-#[cfg(target_os = "macos")]
-unsafe impl Send for Native {}
-#[cfg(target_os = "macos")]
-unsafe impl Sync for Native {}
 
 /// One decoded frame (row-major, no padding between rows).
 ///
@@ -75,36 +67,26 @@ pub struct Frame {
     /// Frame index assigned by the console
     pub index: u16,
     rgb: std::sync::OnceLock<Vec<u8>>,
-    #[cfg(target_os = "macos")]
-    native: Option<Native>,
+    /// The decoder's own buffer when the pixels were not copied out
+    native: Option<hw::NativeBuf>,
 }
 
 impl Frame {
     pub fn new(width: usize, height: usize, format: PixelFormat, data: Vec<u8>, index: u16) -> Self {
-        Self {
-            width,
-            height,
-            format,
-            data,
-            index,
-            rgb: std::sync::OnceLock::new(),
-            #[cfg(target_os = "macos")]
-            native: None,
-        }
+        Self { width, height, format, data, index, rgb: std::sync::OnceLock::new(), native: None }
     }
 
     /// A frame that keeps the decoder's pixel buffer instead of a copy.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn native(pb: vt::PixelBuf, format: PixelFormat, index: u16) -> Self {
-        let (width, height) = (pb.width(), pb.height());
-        Self { native: Some(Native(pb)), ..Self::new(width, height, format, Vec::new(), index) }
+    pub(crate) fn native(buf: hw::NativeBuf, format: PixelFormat, index: u16) -> Self {
+        let (width, height) = (buf.width(), buf.height());
+        Self { native: Some(buf), ..Self::new(width, height, format, Vec::new(), index) }
     }
 
-    /// The decoder's CVPixelBuffer (IOSurface-backed, Metal-compatible) when the pixels were not copied
-    /// out. It lives as long as this frame: hold the frame while the GPU reads it.
-    #[cfg(target_os = "macos")]
-    pub fn cv_pixel_buffer(&self) -> Option<*mut std::ffi::c_void> {
-        self.native.as_ref().map(|n| &*n.0 as *const cidre::cv::PixelBuf as *mut std::ffi::c_void)
+    /// The decoder's own buffer when the pixels were not copied out (macOS: an IOSurface-backed,
+    /// Metal-compatible CVPixelBufferRef; other systems: always `None`). It lives as long as this frame:
+    /// hold the frame while the GPU reads it.
+    pub fn native_buffer(&self) -> Option<*mut std::ffi::c_void> {
+        self.native.as_ref().map(hw::NativeBuf::handle)
     }
 
     /// 8-bit SDR RGB, 3 bytes per pixel.
@@ -114,9 +96,8 @@ impl Frame {
         }
         self.rgb.get_or_init(|| {
             let mut out = vec![0u8; self.width * self.height * 3];
-            #[cfg(target_os = "macos")]
             if let Some(n) = &self.native {
-                native_to_rgb(&n.0, self.format, &mut out);
+                n.to_rgb(self.format, &mut out);
                 return out;
             }
             match self.format {
@@ -139,71 +120,6 @@ fn bgra_to_rgb(src: &[u8], out: &mut [u8]) {
         d[0] = s[2];
         d[1] = s[1];
         d[2] = s[0];
-    });
-}
-
-/// Reads a native frame's pixel buffer into packed RGB (locked read-only for the copy).
-#[cfg(target_os = "macos")]
-fn native_to_rgb(pb: &vt::PixelBuf, format: PixelFormat, out: &mut [u8]) {
-    let mut pb = pb.retained();
-    let flags = cidre::cv::pixel_buffer::LockFlags::READ_ONLY;
-    // SAFETY: the planes are valid while locked; every read stays inside each plane's rows.
-    unsafe {
-        if pb.lock_base_addr(flags).result().is_err() {
-            return;
-        }
-        let (w, h) = (pb.width(), pb.height());
-        match format {
-            PixelFormat::Nv12 { full_range, bt709 } if pb.plane_count() == 2 => {
-                let (y, ys) = (pb.plane_base_address(0), pb.plane_bytes_per_row(0));
-                let (uv, uvs) = (pb.plane_base_address(1), pb.plane_bytes_per_row(1));
-                if !y.is_null() && !uv.is_null() {
-                    let y = std::slice::from_raw_parts(y, ys * h);
-                    let uv = std::slice::from_raw_parts(uv, uvs * h.div_ceil(2));
-                    let spec = ColorSpec {
-                        full_range,
-                        matrix: if bt709 { Matrix::Bt709 } else { Matrix::Bt601 },
-                        ..ColorSpec::default()
-                    };
-                    nv12_to_rgb(y, ys, uv, uvs, w, h, spec, out);
-                }
-            }
-            PixelFormat::Bgra8 | PixelFormat::BgraHdr8 => {
-                let (base, stride) = (pb.base_address() as *const u8, pb.bytes_per_row());
-                if !base.is_null() {
-                    let mut bgra = Vec::with_capacity(w * h * 4);
-                    for row in 0..h {
-                        bgra.extend_from_slice(std::slice::from_raw_parts(base.add(row * stride), w * 4));
-                    }
-                    if format == PixelFormat::Bgra8 {
-                        bgra_to_rgb(&bgra, out);
-                    } else {
-                        hdr_bgra_to_sdr_rgb(&bgra, out, &hdr_sdr_curve());
-                    }
-                }
-            }
-            _ => {}
-        }
-        pb.unlock_lock_base_addr(flags);
-    }
-}
-
-/// The 8-bit integer YUV→RGB that the window's shader also uses.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn nv12_to_rgb(y: &[u8], ys: usize, uv: &[u8], uvs: usize, w: usize, h: usize, spec: ColorSpec, out: &mut [u8]) {
-    let (ym, rv, gu, gv, bu) = coefficients(spec);
-    let y_offset = if spec.full_range { 0 } else { 16 };
-    out.par_chunks_mut(w * 3).take(h).enumerate().for_each(|(row, line)| {
-        for x in 0..w {
-            let c = i32::from(y[row * ys + x]) - y_offset;
-            let d = i32::from(uv[(row / 2) * uvs + (x / 2) * 2]) - 128;
-            let e = i32::from(uv[(row / 2) * uvs + (x / 2) * 2 + 1]) - 128;
-            let base = ym * c;
-            let p = &mut line[x * 3..x * 3 + 3];
-            p[0] = ((base + rv * e + 128) >> 8).clamp(0, 255) as u8;
-            p[1] = ((base + gu * d + gv * e + 128) >> 8).clamp(0, 255) as u8;
-            p[2] = ((base + bu * d + 128) >> 8).clamp(0, 255) as u8;
-        }
     });
 }
 
@@ -573,12 +489,11 @@ pub fn spawn_decoder(
 ) -> std::thread::JoinHandle<()> {
     match codec {
         VideoCodec::H264 => spawn_h264_decoder(rx, out, need_key, range),
-        VideoCodec::H265 => spawn_hevc_decoder(rx, out, need_key, false),
-        VideoCodec::H265Hdr => spawn_hevc_decoder(rx, out, need_key, true),
+        VideoCodec::H265 => hw::spawn_hevc_decoder(rx, out, need_key, false),
+        VideoCodec::H265Hdr => hw::spawn_hevc_decoder(rx, out, need_key, true),
     }
 }
 
-#[cfg(target_os = "macos")]
 /// SDR display curve for HDR frames (see [`PixelFormat::BgraHdr8`]); the window applies it on the GPU.
 pub fn hdr_sdr_curve() -> [u8; 256] {
     // VideoToolbox has already converted the HDR YUV surface to display-referred BGRA.
@@ -740,7 +655,6 @@ mod tests {
         assert_eq!(&rgb[3..6], &[255, 255, 255]);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn hdr_display_curve_preserves_endpoints_and_never_reverses() {
         let lut = hdr_sdr_curve();

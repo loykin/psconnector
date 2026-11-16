@@ -50,6 +50,7 @@ mod login_window;
 mod macros;
 #[cfg(target_os = "macos")]
 mod metal_video;
+mod native_frames;
 mod ocr;
 mod pad;
 mod picture;

@@ -1,9 +1,8 @@
-//! H.265 decoding (VideoToolbox, macOS hardware).
+//! H.265 decoding (VideoToolbox, macOS hardware). Other platforms get `hw`'s stand-in instead.
 
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(target_os = "macos")]
 pub(crate) fn spawn_hevc_decoder(
     rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
     out: watch::Sender<Option<Arc<Frame>>>,
@@ -41,7 +40,7 @@ pub(crate) fn spawn_hevc_decoder(
                             );
                             announced = true;
                         }
-                        out.send_replace(Some(Arc::new(Frame::native(pb, format, index))));
+                        out.send_replace(Some(Arc::new(Frame::native(super::hw::NativeBuf::new(pb), format, index))));
                         stats.shown += 1;
                         stats.convert += t1.elapsed();
                     }
@@ -68,14 +67,4 @@ pub(crate) fn spawn_hevc_decoder(
             }
         })
         .expect("HEVC video thread")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn spawn_hevc_decoder(
-    _rx: std::sync::mpsc::Receiver<(u16, std::time::Instant, Vec<u8>)>,
-    _out: watch::Sender<Option<Arc<Frame>>>,
-    _need_key: Arc<std::sync::atomic::AtomicBool>,
-    _hdr: bool,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(|| warn!("H.265 decoding is not available on this platform"))
 }

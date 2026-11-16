@@ -1,5 +1,5 @@
-//! H.264 decoding: VideoToolbox (hardware) on macOS, openh264 (software) elsewhere or with
-//! PSCONNECTOR_H264=software.
+//! H.264 decoding: the platform's hardware decoder (`hw`; VideoToolbox on macOS) when there is one,
+//! openh264 (software) otherwise or with PSCONNECTOR_H264=software.
 
 #[allow(unused_imports)]
 use super::*;
@@ -29,12 +29,12 @@ pub(crate) fn spawn_h264_decoder(
             let mut levels_logged = false;
             // frames in a row that gave no picture
             let mut failing = 0u32;
-            #[cfg(target_os = "macos")]
-            let mut vt = super::vt::VtH264::new();
-            #[cfg(target_os = "macos")]
-            let mut use_vt = std::env::var("PSCONNECTOR_H264").as_deref() != Ok("software");
-            #[cfg(target_os = "macos")]
-            let (mut was_hw, mut vt_frames, mut vt_errors) = (false, 0u64, 0u64);
+            let mut hw = if std::env::var("PSCONNECTOR_H264").as_deref() == Ok("software") {
+                None
+            } else {
+                super::hw::HwH264::new()
+            };
+            let (mut was_hw, mut hw_frames, mut hw_errors) = (false, 0u64, 0u64);
             let mut next = rx.recv().ok();
             while let Some((index, queued_at, h264)) = next.take() {
                 let detected = ColorSpec::from_h264(&h264).or_else(|| color.is_none().then(ColorSpec::default));
@@ -51,85 +51,84 @@ pub(crate) fn spawn_h264_decoder(
                     );
                     color = Some(detected);
                 }
-                #[cfg(target_os = "macos")]
-                {
-                    let hw = use_vt;
-                    if hw != was_hw {
-                        // the other decoder has no reference frames yet
-                        need_key.store(true, std::sync::atomic::Ordering::SeqCst);
-                        log::info!("H.264 decoded by {}", if hw { "VideoToolbox (hardware)" } else { "openh264 (software)" });
-                        was_hw = hw;
-                    }
-                    if hw {
-                        let queued = queued_at.elapsed();
-                        let t0 = std::time::Instant::now();
-                        let decoded = vt.decode(&h264);
-                        let t_decode = t0.elapsed();
-                        let waiting = rx.try_recv();
-                        let behind = waiting.is_ok();
-                        match decoded {
-                            Ok(Some(pb)) => {
-                                failing = 0;
-                                vt_frames += 1;
-                                if behind {
-                                    stats.skipped += 1;
-                                } else {
-                                    let t1 = std::time::Instant::now();
-                                    let format = match pb.pixel_format() {
-                                        cidre::cv::PixelFormat::_32_BGRA => PixelFormat::Bgra8,
-                                        f => {
-                                            // the samples are as coded; a range picked by hand only changes how
-                                            // the window reads them, so it stays on the hardware path
-                                            let coded_full = f == cidre::cv::PixelFormat::_420F;
-                                            let full_range = match VideoRange::from_atomic(
-                                                range.load(std::sync::atomic::Ordering::Relaxed),
-                                            ) {
+                let using_hw = hw.is_some();
+                if using_hw != was_hw {
+                    // the other decoder has no reference frames yet
+                    need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                    log::info!("H.264 decoded by {}", if using_hw { super::hw::H264_NAME } else { "openh264 (software)" });
+                    was_hw = using_hw;
+                }
+                if let Some(decoder) = hw.as_mut() {
+                    let queued = queued_at.elapsed();
+                    let t0 = std::time::Instant::now();
+                    let decoded = decoder.decode(&h264);
+                    let t_decode = t0.elapsed();
+                    let waiting = rx.try_recv();
+                    let behind = waiting.is_ok();
+                    let mut give_up = false;
+                    match decoded {
+                        Ok(Some((buf, coded))) => {
+                            failing = 0;
+                            hw_frames += 1;
+                            if behind {
+                                stats.skipped += 1;
+                            } else {
+                                let t1 = std::time::Instant::now();
+                                let format = match coded {
+                                    super::hw::Coded::Bgra => PixelFormat::Bgra8,
+                                    super::hw::Coded::Nv12 { full_range: coded_full } => {
+                                        // the samples are as coded; a range picked by hand only changes how
+                                        // the window reads them, so it stays on the hardware path
+                                        let full_range =
+                                            match VideoRange::from_atomic(range.load(std::sync::atomic::Ordering::Relaxed)) {
                                                 VideoRange::Auto => coded_full,
                                                 VideoRange::Limited => false,
                                                 VideoRange::Full => true,
                                             };
-                                            let bt709 = color.unwrap_or_default().matrix == Matrix::Bt709;
-                                            PixelFormat::Nv12 { full_range, bt709 }
-                                        }
-                                    };
-                                    out.send_replace(Some(Arc::new(Frame::native(pb, format, index))));
-                                    stats.shown += 1;
-                                    stats.convert += t1.elapsed();
-                                }
-                            }
-                            Ok(None) => failing += 1,
-                            Err(e) => {
-                                failing += 1;
-                                vt_errors += 1;
-                                if vt_errors <= 3 || vt_errors.is_multiple_of(100) {
-                                    warn!("VideoToolbox H.264: {e}");
-                                }
-                                if vt_frames == 0 && vt_errors >= 120 {
-                                    warn!("VideoToolbox cannot decode this stream; using openh264");
-                                    use_vt = false;
-                                }
+                                        let bt709 = color.unwrap_or_default().matrix == Matrix::Bt709;
+                                        PixelFormat::Nv12 { full_range, bt709 }
+                                    }
+                                };
+                                out.send_replace(Some(Arc::new(Frame::native(buf, format, index))));
+                                stats.shown += 1;
+                                stats.convert += t1.elapsed();
                             }
                         }
-                        if failing > 0 && failing.is_multiple_of(10) {
-                            need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(None) => failing += 1,
+                        Err(e) => {
+                            failing += 1;
+                            hw_errors += 1;
+                            if hw_errors <= 3 || hw_errors.is_multiple_of(100) {
+                                warn!("hardware H.264: {e}");
+                            }
+                            if hw_frames == 0 && hw_errors >= 120 {
+                                warn!("the hardware decoder cannot decode this stream; using openh264");
+                                give_up = true;
+                            }
                         }
-                        if failing >= 60 {
-                            log::info!("video decoder stuck after a damaged frame; starting a fresh one");
-                            vt.reset();
-                            failing = 0;
-                        }
-                        stats.decoded += 1;
-                        stats.queue += queued;
-                        stats.max_queue = stats.max_queue.max(queued);
-                        stats.decode += t_decode;
-                        stats.report();
-                        next = match waiting {
-                            Ok(f) => Some(f),
-                            Err(std::sync::mpsc::TryRecvError::Empty) => rx.recv().ok(),
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-                        };
-                        continue;
                     }
+                    if failing > 0 && failing.is_multiple_of(10) {
+                        need_key.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if failing >= 60 {
+                        log::info!("video decoder stuck after a damaged frame; starting a fresh one");
+                        decoder.reset();
+                        failing = 0;
+                    }
+                    if give_up {
+                        hw = None;
+                    }
+                    stats.decoded += 1;
+                    stats.queue += queued;
+                    stats.max_queue = stats.max_queue.max(queued);
+                    stats.decode += t_decode;
+                    stats.report();
+                    next = match waiting {
+                        Ok(f) => Some(f),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => rx.recv().ok(),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                    };
+                    continue;
                 }
                 let queued = queued_at.elapsed();
                 let t0 = std::time::Instant::now();
