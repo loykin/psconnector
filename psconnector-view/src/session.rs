@@ -22,6 +22,8 @@ pub(crate) struct Shared {
     /// Name of the game controller connected to this computer, if any
     pub(crate) pad: Arc<Mutex<Option<String>>>,
     pub(crate) recorder: Arc<record::Recorder>,
+    /// Finger ids for swipes sent through the command port
+    pub(crate) touch_ids: std::sync::atomic::AtomicU32,
     /// Sound is playing (false with --no-audio or without an output device)
     pub(crate) sound: bool,
     pub(crate) muted: Arc<AtomicBool>,
@@ -177,6 +179,7 @@ pub(crate) fn start_session(
         osd: Mutex::new(String::new()),
         pad: out.pad.clone(),
         recorder: out.recorder.clone(),
+        touch_ids: std::sync::atomic::AtomicU32::new(0),
         sound: out.audio.is_some(),
         muted: out.muted.clone(),
         playing: AtomicBool::new(false),

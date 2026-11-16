@@ -193,6 +193,8 @@ fn lap(port: &mut Port, events: &[Value], checkpoints: &[Checkpoint]) -> Result<
             port.call(&json!({"button": b, "action": ev["a"].as_str().unwrap_or("release")}))?;
         } else if let Some(s) = ev["s"].as_str() {
             port.call(&json!({"stick": s, "x": ev["x"], "y": ev["y"]}))?;
+        } else if let Some(id) = ev["touch"].as_u64() {
+            port.call(&json!({"touch": id, "down": ev["down"], "x": ev["x"], "y": ev["y"]}))?;
         }
     }
     Ok(true)

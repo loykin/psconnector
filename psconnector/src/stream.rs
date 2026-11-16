@@ -134,6 +134,7 @@ struct VideoState {
 pub enum Cmd {
     Button { button: Button, pressed: bool, queued_at: std::time::Instant },
     Stick { right: bool, x: f32, y: f32, queued_at: std::time::Instant },
+    Touch { id: u8, down: bool, x: u16, y: u16 },
     Stop,
 }
 
@@ -334,8 +335,20 @@ impl Stream {
 
     /// Sends a button event and returns the packet so it can be re-sent once.
     async fn send_event(&mut self, button: Button, pressed: bool) -> Option<Vec<u8>> {
-        let c = self.cipher.as_mut()?;
+        self.cipher.as_ref()?;
         let data = self.events.push(button, pressed);
+        self.send_history(data).await
+    }
+
+    /// Sends a touch event (5 bytes) in the same event history as the buttons.
+    async fn send_touch(&mut self, id: u8, down: bool, x: u16, y: u16) -> Option<Vec<u8>> {
+        self.cipher.as_ref()?;
+        let data = self.events.push_raw(crate::controller::touch_event(id, down, x, y).to_vec());
+        self.send_history(data).await
+    }
+
+    async fn send_history(&mut self, data: Vec<u8>) -> Option<Vec<u8>> {
+        let c = self.cipher.as_mut()?;
         let pkt = takion::feedback(header::FEEDBACK_EVENT, self.events.sequence, &data, c);
         self.events.sequence = self.events.sequence.wrapping_add(1);
         self.send(&pkt).await;
@@ -635,6 +648,11 @@ pub async fn run(
                     }
                     input_stats.button(queued_at, dequeued_at);
                     input_stats.report();
+                }
+                Some(Cmd::Touch { id, down, x, y }) => {
+                    if let Some(pkt) = s.send_touch(id, down, x, y).await {
+                        resend = Some((Instant::now() + EVENT_RESEND, pkt));
+                    }
                 }
                 Some(Cmd::Stick { right, x, y, queued_at }) => {
                     if right { s.sticks.right = (x, y) } else { s.sticks.left = (x, y) }

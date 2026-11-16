@@ -41,7 +41,7 @@ pub use error::{Error, Result};
 use tokio::sync::{mpsc, watch};
 
 pub use audio::Audio;
-pub use controller::Button;
+pub use controller::{Button, TOUCHPAD_SIZE};
 use std::sync::Arc;
 pub use stream::{Phase, StreamConfig};
 pub use video::VideoRange;
@@ -235,6 +235,13 @@ impl Client {
         self.press(b);
         tokio::time::sleep(hold).await;
         self.release(b);
+    }
+
+    /// A finger on the touchpad: `id` tells fingers apart (a new touch should get a new id), `x`/`y` are in
+    /// [`TOUCHPAD_SIZE`] coordinates. Send `down` with each new position while it moves, then `down = false`
+    /// (with the last position) when it lifts.
+    pub fn touch(&self, id: u8, down: bool, x: u16, y: u16) {
+        let _ = self.cmd.send(stream::Cmd::Touch { id, down, x, y });
     }
 
     /// Stick: x and y are -1.0 to 1.0 (up is negative).

@@ -29,6 +29,13 @@ pub(crate) async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
+/// A touchpad point from JSON numbers, kept on the pad.
+fn touch_point(x: &Value, y: &Value) -> (u16, u16) {
+    let (w, h) = psconnector::TOUCHPAD_SIZE;
+    let c = |v: &Value, max: u16| v.as_f64().unwrap_or(0.0).round().clamp(0.0, f64::from(max - 1)) as u16;
+    (c(x, w), c(y, h))
+}
+
 pub(crate) fn button(name: &str) -> Result<Button> {
     Button::parse(name).ok_or_else(|| anyhow!("unknown button: {name}"))
 }
@@ -48,6 +55,27 @@ pub(crate) async fn handle(line: &str, sh: &Arc<Shared>) -> Result<Reply> {
     } else if let Some(which) = m["stick"].as_str() {
         let (x, y) = (m["x"].as_f64().unwrap_or(0.0) as f32, m["y"].as_f64().unwrap_or(0.0) as f32);
         c.stick(which == "right", x, y);
+    } else if let Some(id) = m["touch"].as_u64() {
+        let (x, y) = touch_point(&m["x"], &m["y"]);
+        c.touch(id as u8, m["down"].as_bool().unwrap_or(true), x, y);
+    } else if let Some(path) = m["swipe"].as_array() {
+        // {"swipe": [x0, y0, x1, y1], "ms": 300}: one finger from the first point to the second
+        let v: Vec<f64> = path.iter().filter_map(Value::as_f64).collect();
+        let [x0, y0, x1, y1] = v.as_slice() else { bail!("swipe needs [x0, y0, x1, y1]") };
+        let ms = m["ms"].as_f64().unwrap_or(300.0).clamp(16.0, 10_000.0);
+        let steps = (ms / 16.0).ceil() as u32;
+        let id = 0x40 | (sh.touch_ids.fetch_add(1, Ordering::Relaxed) & 0x3F) as u8;
+        let at = |k: u32| {
+            let f = f64::from(k) / f64::from(steps);
+            touch_point(&Value::from(x0 + (x1 - x0) * f), &Value::from(y0 + (y1 - y0) * f))
+        };
+        for k in 0..=steps {
+            let (x, y) = at(k);
+            c.touch(id, true, x, y);
+            tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0 / f64::from(steps))).await;
+        }
+        let (x, y) = at(steps);
+        c.touch(id, false, x, y);
     } else if m.get("release_all").is_some() {
         sh.release_all();
     } else if m.get("frame").is_some() {

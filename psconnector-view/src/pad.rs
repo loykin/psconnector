@@ -69,6 +69,15 @@ fn map(b: Pad) -> Option<Button> {
     })
 }
 
+/// PS5 buttons for pad buttons gilrs leaves unnamed, by their raw code. gilrs reports the DualSense
+/// touchpad click (and the Edge's extra buttons) as `Unknown`, so without this the map, menus and anything
+/// else on the touchpad cannot be reached from a local pad.
+fn unnamed(raw: u32) -> Option<Button> {
+    // macOS (IOKit): HID usage page 9 (buttons) << 16 | usage; the DualSense touchpad click is usage 14
+    const MACOS_TOUCHPAD: u32 = 0x0009_000E;
+    (cfg!(target_os = "macos") && raw == MACOS_TOUCHPAD).then_some(Button::Touchpad)
+}
+
 /// Current stick position from the pad, and what was last sent to the PS5.
 #[derive(Default)]
 struct Sticks {
@@ -133,6 +142,7 @@ pub fn spawn(
             *name.lock().unwrap() = first;
         };
         let mut sticks = Sticks::default();
+        let mut logged = std::collections::HashSet::new();
         let mut delay = Delay::default();
         loop {
             // wakes as soon as the OS reports input; nothing else runs on this thread, so no timeout
@@ -144,6 +154,24 @@ pub fn spawn(
                 delay.add(ev.time);
             }
             match ev.event {
+                // buttons gilrs has no name for: the touchpad click is one of them
+                EventType::ButtonPressed(Pad::Unknown, code) | EventType::ButtonReleased(Pad::Unknown, code) => {
+                    let down = matches!(ev.event, EventType::ButtonPressed(..));
+                    match (unnamed(code.into_u32()), client()) {
+                        (Some(b), Some(c)) => {
+                            if down {
+                                c.press(b);
+                            } else {
+                                c.release(b);
+                            }
+                            recorder.button(b, down);
+                        }
+                        (None, _) if down && logged.insert(code) => {
+                            log::debug!("pad: unmapped button {code} (raw {:#x})", code.into_u32());
+                        }
+                        _ => {}
+                    }
+                }
                 EventType::ButtonPressed(b, _) => {
                     if let (Some(b), Some(c)) = (map(b), client()) {
                         c.press(b);
@@ -188,6 +216,13 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn touchpad_click_reaches_the_ps5() {
+        assert_eq!(unnamed(0x0009_000E), Some(Button::Touchpad));
+        assert_eq!(unnamed(0x0009_0007), None, "L2's digital click stays with the analog trigger");
+    }
 
     #[test]
     fn idle_pad_sends_nothing_and_centering_is_sent_once() {

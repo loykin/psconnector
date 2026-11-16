@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Events: `{"t": secs, "b": "cross", "a": "press|release"}`, `{"t": secs, "s": "left|right", "x": .., "y": ..}`
-//! and `{"t": secs, "cp": index}`. Checkpoints: `{"t", "image", "region": [x0, y0, x1, y1], "tol", "changed",
+//! `{"t": secs, "touch": id, "down": bool, "x": .., "y": ..}` (touchpad finger, 1920 × 1080) and
+//! `{"t": secs, "cp": index}`. Checkpoints: `{"t", "image", "region": [x0, y0, x1, y1], "tol", "changed",
 //! "timeout"}` (region as fractions of the frame; the screen matches when its mean difference, 0..255, is at
 //! most `tol` and at most `changed` percent of it changed a lot). For a checkpoint in a moving 3D scene,
 //! raise both; to watch only part of the screen (a menu, a HUD element), narrow `region`. Only the checkpoints marked while recording
@@ -127,6 +128,8 @@ pub(crate) struct Take {
     events: Vec<Value>,
     checkpoints: Vec<Checkpoint>,
     held: Vec<Button>,
+    /// fingers still on the touchpad: (id, x, y)
+    touching: Vec<(u8, u16, u16)>,
     ended: Option<f64>,
 }
 
@@ -139,7 +142,7 @@ impl Take {
         self.checkpoints.len()
     }
 
-    /// Button and stick events (checkpoints not counted).
+    /// Button, stick and touch events (checkpoints not counted).
     pub(crate) fn inputs(&self) -> usize {
         self.events.iter().filter(|e| e.get("cp").is_none()).count()
     }
@@ -170,6 +173,7 @@ impl Recorder {
             events: Vec::new(),
             checkpoints: Vec::new(),
             held: Vec::new(),
+            touching: Vec::new(),
             ended: None,
         };
         *self.take.lock().unwrap() = Some(take);
@@ -209,12 +213,26 @@ impl Recorder {
         }
     }
 
+    pub(crate) fn touch(&self, id: u8, down: bool, x: u16, y: u16) {
+        if let Some(t) = self.take.lock().unwrap().as_mut() {
+            let at = t.now();
+            t.events.push(json!({"t": at, "touch": id, "down": down, "x": x, "y": y}));
+            t.touching.retain(|(i, ..)| *i != id);
+            if down {
+                t.touching.push((id, x, y));
+            }
+        }
+    }
+
     /// Stops recording. Whatever is still held is released at the end, so a replay never leaves it pressed.
     pub(crate) fn stop(&self) -> Option<Take> {
         let mut take = self.take.lock().unwrap().take()?;
         let at = take.now();
         for b in std::mem::take(&mut take.held) {
             take.events.push(json!({"t": at, "b": b.name(), "a": "release"}));
+        }
+        for (id, x, y) in std::mem::take(&mut take.touching) {
+            take.events.push(json!({"t": at, "touch": id, "down": false, "x": x, "y": y}));
         }
         take.ended = Some(at);
         Some(take)

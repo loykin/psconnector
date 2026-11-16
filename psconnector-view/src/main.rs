@@ -17,6 +17,8 @@
 //!   At the limit, a macro that polls `should_stop` gets 2 minutes to finish; others are stopped right away.
 //!
 //! Commands: `{"button":"cross","action":"tap|press|release","hold":0.08}` `{"stick":"left","x":0,"y":-1}`
+//! `{"touch":0,"down":true,"x":960,"y":540}` (a finger on the touchpad, 1920×1080; `down:false` lifts it)
+//! `{"swipe":[x0,y0,x1,y1],"ms":300}` (a finger moved across the touchpad; returns when done)
 //! `{"release_all":true}` `{"snap":"path.png"}` `{"screen_snap":"path.png"}` `{"frame":true}`
 //! `{"play":"recording.json"}` `{"stop":true}` `{"thumb":[x0,y0,x1,y1]}` (the screen at checkpoint size: reply
 //! `ok WIDTH HEIGHT BYTES` and the RGB bytes, like `frame`)
@@ -63,6 +65,7 @@ mod settings;
 mod setup;
 mod sound;
 mod theme;
+mod touch;
 mod viewer;
 
 #[allow(unused_imports)]
@@ -222,6 +225,8 @@ fn main() -> Result<()> {
             outputs.pad.clone(),
             outputs.recorder.clone(),
         );
+        let current = session.clone();
+        touch::spawn(move || current.lock().unwrap().as_ref().map(|s| s.client()), outputs.recorder.clone());
     }
     let app_session = session.clone();
     let handle = rt.handle().clone();

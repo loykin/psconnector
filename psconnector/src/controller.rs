@@ -90,9 +90,19 @@ impl Button {
     }
 }
 
+/// Width and height of the touchpad in the coordinates touch events use (the DualSense's own).
+pub const TOUCHPAD_SIZE: (u16, u16) = (1920, 1080);
+
+/// 5-byte touch event: `0xD0` (finger down or moved) / `0xC0` (lifted), the finger's id (7 bits), then x and
+/// y as 12 bits each. The same layout chiaki uses.
+pub fn touch_event(id: u8, down: bool, x: u16, y: u16) -> [u8; 5] {
+    let (x, y) = (x.min(0xFFF), y.min(0xFFF));
+    [if down { 0xD0 } else { 0xC0 }, id & 0x7F, (x >> 4) as u8, (((x & 0xF) << 4) as u8) | (y >> 8) as u8, y as u8]
+}
+
 /// Sends the last few events together, so a lost packet's event is still in the next one.
 pub struct EventHistory {
-    events: VecDeque<[u8; 3]>,
+    events: VecDeque<Vec<u8>>,
     pub sequence: u16,
 }
 
@@ -105,7 +115,12 @@ impl EventHistory {
 
     /// Puts a new event first and returns the data to send (newest → oldest).
     pub fn push(&mut self, button: Button, pressed: bool) -> Vec<u8> {
-        self.events.push_front(button.event(pressed));
+        self.push_raw(button.event(pressed).to_vec())
+    }
+
+    /// Puts any encoded event first (touch events are 5 bytes) and returns the data to send.
+    pub fn push_raw(&mut self, event: Vec<u8>) -> Vec<u8> {
+        self.events.push_front(event);
         self.events.truncate(Self::MAX);
         self.data()
     }
@@ -144,5 +159,21 @@ impl Sticks {
         }
         buf.extend_from_slice(&[0, 0, 1]);
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_events_pack_x_and_y_into_twelve_bits() {
+        assert_eq!(touch_event(3, true, 0x123, 0x456), [0xD0, 3, 0x12, 0x34, 0x56]);
+        assert_eq!(touch_event(0x85, false, 1919, 1079), [0xC0, 0x05, 0x77, 0xF4, 0x37]);
+        let mut h = EventHistory::new();
+        h.push(Button::Cross, true);
+        let data = h.push_raw(touch_event(1, true, 0, 0).to_vec());
+        assert_eq!(data.len(), 8, "newest (touch) first, then the button");
+        assert_eq!(data[0], 0xD0);
     }
 }
