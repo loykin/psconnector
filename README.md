@@ -10,6 +10,7 @@ It is a connection layer that lets game macros and AI assistants operate a PS5.
 | Crate | Kind | Purpose |
 |---|---|---|
 | `psconnector` | library | Session, Takion, controller input, video and audio decoding |
+| `psconnector-protocol` | library | The command port protocol (commands, replies) and the shared settings file, used by the window, the MCP server and the replay |
 | `psconnector-view` | binary | Screen window, macro command port (8650), macro bar |
 | `psconnector-mcp` | binary | MCP server for AI assistants (Claude Code, Codex, ...) |
 | `python/psconnector.py` | Python module | Simple interface for writing macros (standard library only) |
@@ -41,19 +42,19 @@ Internal modules:
 
 | Module | Purpose |
 |---|---|
-| `ddp` | Status and wake-up (UDP 9302) |
-| `session` | Session setup and control channel (TCP 9295) |
-| `rpcrypt` | Session-stage encryption (AES-CFB) |
+| `net::ddp` | Status and wake-up (UDP 9302) |
+| `net::session` | Session setup and control channel (TCP 9295) |
+| `crypto::rpcrypt` | Session-stage encryption (AES-CFB) |
 | `stream` | Takion connection and the send task (UDP 9296) |
-| `takion` | Building and parsing Takion packets |
-| `gkcrypt` | Stream-stage encryption (ECDH, key stream, GMAC) |
+| `net::takion` | Building and parsing Takion packets |
+| `crypto::gkcrypt` | Stream-stage encryption (ECDH, key stream, GMAC) |
 | `controller` | Button events and stick state data |
 | `video` | Video unit assembly with FEC recovery (`video/fec.rs`), decoders: VideoToolbox H.264/H.265 on macOS, openh264 |
 | `audio` | Audio packets, frame order and loss recovery, Opus decoder thread |
-| `proto` | Takion protobuf messages |
-| `profile` | Registration data (`~/.psconnector/profile.json`; also reads pyremoteplay's `~/.pyremoteplay/.profile.json`) |
-| `psn` | PSN sign-in through the browser, account id |
-| `register` | PIN registration with a PS5 |
+| `net::proto` | Takion protobuf messages |
+| `account::profile` | Registration data (`~/.psconnector/profile.json`; also reads pyremoteplay's `~/.pyremoteplay/.profile.json`) |
+| `account::psn` | PSN sign-in through the browser, account id |
+| `account::register` | PIN registration with a PS5 |
 
 ## Library usage
 

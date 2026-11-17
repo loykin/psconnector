@@ -1,0 +1,13 @@
+[package]
+name = "psconnector-protocol"
+description = "The psconnector-view command port: commands, replies, and the shared settings file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+psconnector.workspace = true
+log.workspace = true
+png.workspace = true
+serde_json.workspace = true

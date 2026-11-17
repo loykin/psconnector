@@ -4723,12 +4723,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "png",
  "psconnector",
+ "psconnector-protocol",
  "rmcp",
  "serde",
- "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "psconnector-protocol"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "png",
+ "psconnector",
+ "serde_json",
 ]
 
 [[package]]
@@ -4754,6 +4763,7 @@ dependencies = [
  "objc2-vision",
  "png",
  "psconnector",
+ "psconnector-protocol",
  "rayon",
  "serde_json",
  "tao",
