@@ -351,7 +351,8 @@ mod tests {
         if std::env::var_os("UPDATE_DESIGN_TOKENS").is_some() {
             std::fs::write(&path, super::TOKENS_CSS).unwrap();
         }
-        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        // a Windows checkout may turn the line endings into CRLF
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
         assert!(
             on_disk == super::TOKENS_CSS,
             "design/tokens.css is out of date: run UPDATE_DESIGN_TOKENS=1 cargo test -p psconnector-view tokens"
