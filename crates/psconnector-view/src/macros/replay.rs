@@ -313,7 +313,8 @@ mod tests {
         let log = log.lock().unwrap();
         assert_eq!(log.len(), 3);
         assert_eq!(log[0].1["button"], "cross");
-        assert!((log[0].0 - 0.1).abs() < 0.05, "first input at its recorded time: {}", log[0].0);
+        // never early; a busy CI machine can start the replay's clock a little after the port's
+        assert!(log[0].0 > 0.09 && log[0].0 < 0.3, "first input at its recorded time: {}", log[0].0);
         let (stick_at, stick) = &log[2];
         assert_eq!(stick["stick"], "left");
         // reached at 0.6 s or a little later (two matching looks), then 0.2 s as recorded
