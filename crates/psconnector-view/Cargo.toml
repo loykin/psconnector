@@ -24,6 +24,10 @@ rayon = "1.11"
 serde_json.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# component gallery snapshots (design/screens/gallery-*.png)
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+
 [build-dependencies]
 # design/tokens.json -> theme constants
 serde_json.workspace = true

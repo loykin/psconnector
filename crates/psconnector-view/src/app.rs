@@ -231,7 +231,7 @@ fn app_icon() -> Option<egui::IconData> {
     })
 }
 
-fn setup_fonts(ctx: &egui::Context) {
+pub(crate) fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     if let Ok(data) = std::fs::read(FONT) {
         fonts.font_data.insert("korean".into(), Arc::new(egui::FontData::from_owned(data)));

@@ -5,6 +5,7 @@
 //!     [--quality low|720p|1080p] [--bitrate KBPS] [--no-pad] [--no-audio] [--mute] [--run MACRO [--for MIN] [--after none|standby] [--at HH:MM|+MIN]]
 //! - A game controller connected to this computer (DualSense, ...) drives the PS5 directly (off with `--no-pad`).
 //! - The console's sound plays on the default output device (🔊 in the bar mutes it; `--mute`, `--no-audio`).
+//! - `--gallery` opens the component gallery (every component of the design system, no PS5 needed).
 //! ```
 //! - Command port (127.0.0.1:8650, one JSON object per line): the same commands as the Python `ps5view.py`
 //!   plus `frame` and `release_all`, so existing macros run unchanged. From Python, use `python/psconnector.py`.
@@ -48,6 +49,7 @@ mod video;
 fn main() -> anyhow::Result<()> {
     match cli::parse(std::env::args().skip(1))? {
         cli::Mode::LoginWindow => ui::login_window::run(),
+        cli::Mode::Gallery => ui::gallery::run(),
         cli::Mode::Replay { path, repeat } => macros::replay::run(&path, repeat),
         cli::Mode::Window(args) => {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

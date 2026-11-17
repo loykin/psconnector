@@ -87,30 +87,13 @@ impl Viewer {
 
     /// While recording: time, checkpoints, a Checkpoint button (or C) and Stop.
     fn recording_widget(&mut self, ui: &mut egui::Ui) {
-        let t = theme::tokens(ui);
         let (secs, checkpoints, inputs) = self.shared.recorder.progress().unwrap_or_default();
         let info = format!(
             "{} · {checkpoints} checkpoint{} · {inputs} inputs",
             hms(Duration::from_secs_f64(secs)),
             if checkpoints == 1 { "" } else { "s" }
         );
-        let (mark, stop) = state_strip(ui, t.danger_soft, t.danger, |ui| {
-            theme::status_dot(ui, t.danger);
-            ui.label("Recording");
-            ui.label(egui::RichText::new(info).color(t.muted));
-            let mark = ui
-                .add(
-                    egui::Button::new(format!("{}  Checkpoint", icon::FLAG))
-                        .frame_when_inactive(false)
-                        .min_size(egui::vec2(0.0, theme::size::CONTROL)),
-                )
-                .on_hover_text(
-                    "Press when the screen shows something the replay should wait for (a menu, the end of a \
-                     load, a place). The replay waits here until the screen looks like this again. Key: C",
-                )
-                .clicked();
-            (mark, end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop recording").clicked())
-        });
+        let (mark, stop) = recording_strip(ui, &info);
         if mark && let Some(f) = self.shared.client().frame() {
             self.shared.recorder.checkpoint(&f);
         }
@@ -129,21 +112,14 @@ impl Viewer {
     /// After recording: name it, Save or Discard (how often it repeats is set in the macro options).
     fn save_widget(&mut self, ui: &mut egui::Ui, r: &mut Runner) {
         let Some(s) = self.rec_save.as_mut() else { return };
-        let t = theme::tokens(ui);
-        let mut save = false;
-        let mut discard = false;
-        ui.label(egui::RichText::new(icon::RECORD).color(t.danger));
-        let resp = ui.add(theme::field(&mut s.name, theme::size::CONTROL).desired_width(170.0));
-        save |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        save |= theme::primary(ui, true, &format!("{}  Save", icon::SAVE)).clicked();
-        discard |= theme::ghost(ui, true, "Discard").clicked();
         let summary = format!(
             "{} · {} checkpoints · {} inputs",
             hms(Duration::from_secs_f64(s.take.duration())),
             s.take.checkpoints(),
             s.take.inputs()
         );
-        ui.label(theme::caption(ui, s.error.clone().unwrap_or(summary)));
+        let line = s.error.clone().unwrap_or(summary);
+        let (save, discard) = save_row(ui, &mut s.name, &line);
         if discard {
             self.rec_save = None;
         } else if save {
@@ -241,7 +217,7 @@ fn state_strip<R>(
 
 /// One widget for macros, like an IDE's run widget: what it shows depends on whether a macro is running,
 /// scheduled or idle, so the three never compete for space. Returns true when Record was pressed.
-fn macro_widget(ui: &mut egui::Ui, r: &mut Runner, has_pad: bool) -> bool {
+pub(crate) fn macro_widget(ui: &mut egui::Ui, r: &mut Runner, has_pad: bool) -> bool {
     let t = theme::tokens(ui);
     let names: Vec<String> = match &r.macros {
         Ok(list) => list.iter().map(|m| m.name.clone()).collect(),
@@ -261,35 +237,17 @@ fn macro_widget(ui: &mut egui::Ui, r: &mut Runner, has_pad: bool) -> bool {
             times += " · finishing";
         }
         let name = run.name.clone();
-        let stop = state_strip(ui, t.accent_soft, t.accent, |ui| {
-            theme::status_dot(ui, t.success);
-            ui.label(&name);
-            ui.label(egui::RichText::new(times).color(t.muted));
-            end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop the macro").clicked()
-        });
-        if stop {
+        let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
+        if running_strip(ui, &name, &times, &last) {
             r.stop();
         }
-        let last = r.log.lock().unwrap().back().cloned().unwrap_or_default();
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(egui::RichText::new(last).size(theme::size::CAPTION).color(t.faint)).truncate());
         return false;
     }
     if let Some(sc) = &r.scheduled {
         let name = names.get(sc.index).cloned().unwrap_or_default();
         let wait = sc.at.duration_since(SystemTime::now()).unwrap_or_default();
         let label = format!("{name} · {}", sc.label);
-        let cancel = state_strip(ui, egui::Color32::TRANSPARENT, t.faint, |ui| {
-            ui.label(egui::RichText::new(icon::CLOCK).color(t.muted));
-            ui.label(label);
-            ui.label(egui::RichText::new(format!("in {}", hms(wait))).color(t.muted));
-            let b = egui::Button::new("Cancel")
-                .frame_when_inactive(false)
-                .corner_radius(end_radius(false))
-                .min_size(egui::vec2(0.0, theme::size::CONTROL));
-            ui.add(b).clicked()
-        });
-        if cancel {
+        if scheduled_strip(ui, &label, &format!("in {}", hms(wait))) {
             r.cancel_schedule();
         }
         return false;
@@ -432,20 +390,90 @@ fn delete_recording(ui: &mut egui::Ui, r: &mut Runner) {
         }
         return;
     }
+    let (delete, cancel) = delete_confirm(ui, &name);
+    if delete {
+        ui.data_mut(|d| d.remove::<String>(id));
+        match r.delete_selected() {
+            Ok(msg) => r.last_exit = Some(msg),
+            Err(e) => r.last_exit = Some(format!("Not deleted: {e}")),
+        }
+    }
+    if cancel {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+}
+
+// ---- the macro widget's states as plain views (also drawn by the component gallery) ----
+
+/// A macro running: dot, name, times and Stop; then the macro's last log line. True when Stop was pressed.
+pub(crate) fn running_strip(ui: &mut egui::Ui, name: &str, times: &str, last_line: &str) -> bool {
+    let t = theme::tokens(ui);
+    let stop = state_strip(ui, t.accent_soft, t.accent, |ui| {
+        theme::status_dot(ui, t.success);
+        ui.label(name);
+        ui.label(egui::RichText::new(times).color(t.muted));
+        end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop the macro").clicked()
+    });
+    ui.add_space(6.0);
+    ui.add(egui::Label::new(egui::RichText::new(last_line).size(theme::size::CAPTION).color(t.faint)).truncate());
+    stop
+}
+
+/// A run waiting for its start time. True when Cancel was pressed.
+pub(crate) fn scheduled_strip(ui: &mut egui::Ui, label: &str, wait: &str) -> bool {
+    let t = theme::tokens(ui);
+    state_strip(ui, egui::Color32::TRANSPARENT, t.faint, |ui| {
+        ui.label(egui::RichText::new(icon::CLOCK).color(t.muted));
+        ui.label(label);
+        ui.label(egui::RichText::new(wait).color(t.muted));
+        let b = egui::Button::new("Cancel")
+            .frame_when_inactive(false)
+            .corner_radius(end_radius(false))
+            .min_size(egui::vec2(0.0, theme::size::CONTROL));
+        ui.add(b).clicked()
+    })
+}
+
+/// Recording the pad: time, counts, Checkpoint and Stop. Returns (checkpoint, stop) pressed.
+pub(crate) fn recording_strip(ui: &mut egui::Ui, info: &str) -> (bool, bool) {
+    let t = theme::tokens(ui);
+    state_strip(ui, t.danger_soft, t.danger, |ui| {
+        theme::status_dot(ui, t.danger);
+        ui.label("Recording");
+        ui.label(egui::RichText::new(info).color(t.muted));
+        let mark = ui
+            .add(
+                egui::Button::new(format!("{}  Checkpoint", icon::FLAG))
+                    .frame_when_inactive(false)
+                    .min_size(egui::vec2(0.0, theme::size::CONTROL)),
+            )
+            .on_hover_text(
+                "Press when the screen shows something the replay should wait for (a menu, the end of a \
+                 load, a place). The replay waits here until the screen looks like this again. Key: C",
+            )
+            .clicked();
+        (mark, end_button(ui, icon::STOP, t.danger, true).on_hover_text("Stop recording").clicked())
+    })
+}
+
+/// Naming a finished recording: name field, Save, Discard and a line under them. Returns (save, discard).
+pub(crate) fn save_row(ui: &mut egui::Ui, name: &mut String, line: &str) -> (bool, bool) {
+    let t = theme::tokens(ui);
+    ui.label(egui::RichText::new(icon::RECORD).color(t.danger));
+    let resp = ui.add(theme::field(name, theme::size::CONTROL).desired_width(170.0));
+    let mut save = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    save |= theme::primary(ui, true, &format!("{}  Save", icon::SAVE)).clicked();
+    let discard = theme::ghost(ui, true, "Discard").clicked();
+    ui.label(theme::caption(ui, line));
+    (save, discard)
+}
+
+/// The second step of deleting a recording. Returns (delete, cancel) pressed.
+pub(crate) fn delete_confirm(ui: &mut egui::Ui, name: &str) -> (bool, bool) {
     let where_to = if cfg!(target_os = "macos") { "It goes to the Trash." } else { "This cannot be undone." };
     ui.label(theme::caption(ui, format!("Delete “{name}”? {where_to}")));
-    ui.horizontal(|ui| {
-        if theme::destructive(ui, true, "Delete").clicked() {
-            ui.data_mut(|d| d.remove::<String>(id));
-            match r.delete_selected() {
-                Ok(msg) => r.last_exit = Some(msg),
-                Err(e) => r.last_exit = Some(format!("Not deleted: {e}")),
-            }
-        }
-        if theme::ghost(ui, true, "Cancel").clicked() {
-            ui.data_mut(|d| d.remove::<String>(id));
-        }
-    });
+    ui.horizontal(|ui| (theme::destructive(ui, true, "Delete").clicked(), theme::ghost(ui, true, "Cancel").clicked()))
+        .inner
 }
 
 /// What ▶ will do with these options, in one sentence.

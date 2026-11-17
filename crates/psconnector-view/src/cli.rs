@@ -10,6 +10,8 @@ use crate::quality::Quality;
 pub(crate) enum Mode {
     /// `--login-window`: the PSN sign-in web view, run as its own process
     LoginWindow,
+    /// `--gallery`: every component of the design system on one screen, without a PS5
+    Gallery,
     /// `--replay FILE [--repeat N]`: play a recording against a running window (a macro process)
     Replay {
         path: PathBuf,
@@ -51,6 +53,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Mode> {
     let all: Vec<String> = args.into_iter().collect();
     match all.first().map(String::as_str) {
         Some("--login-window") => return Ok(Mode::LoginWindow),
+        Some("--gallery") => return Ok(Mode::Gallery),
         Some("--replay") => {
             let path = PathBuf::from(all.get(1).map_or("recording.json", String::as_str));
             let repeat = match all.get(2).map(String::as_str) {

@@ -1,6 +1,6 @@
 //! The streaming window: video, the bar and the picture controls.
 
-mod bar;
+pub(crate) mod bar;
 mod picture_panel;
 
 use std::sync::atomic::Ordering;

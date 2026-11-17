@@ -9,6 +9,29 @@ The look of psconnector-view and of any web page that goes with it (macro report
 | [`tokens.css`](tokens.css) | The same tokens as CSS custom properties (`--ps-*`) for web pages. Generated; a test fails when it is out of date. |
 | `crates/psconnector-view/src/ui/theme.rs` | The egui components built on the tokens. Screens use only these. |
 
+## Seeing it: the component gallery
+
+Every token, every component and every state of the bar's macro widget on one screen, without a PS5:
+
+```bash
+cargo run --release -p psconnector-view -- --gallery
+```
+
+The same screen is kept as images, so a change in the look shows up as an image diff:
+
+| Light | Dark |
+|---|---|
+| ![Gallery, light](screens/gallery-light.png) | ![Gallery, dark](screens/gallery-dark.png) |
+
+```bash
+# compare the current look with the saved images (renders with the GPU, so not part of a normal test run)
+cargo test -p psconnector-view gallery -- --ignored
+# after an intended change: save new images
+UPDATE_SNAPSHOTS=1 cargo test -p psconnector-view gallery -- --ignored
+```
+
+A new component goes into the gallery (`crates/psconnector-view/src/ui/gallery.rs`) as well as into `ui::theme`; a state of a bar widget is drawn by a plain view function (`running_strip`, `recording_strip`, …) that both the bar and the gallery call.
+
 After editing `tokens.json`:
 
 ```bash
@@ -136,5 +159,5 @@ body { background: var(--ps-bg); color: var(--ps-text); font: var(--ps-body)/1.5
 ## Adding to it
 
 - A new colour or size goes into `tokens.json` with its role, then regenerate.
-- A new component goes into `ui::theme`, built only from tokens, and gets a row in the table above.
+- A new component goes into `ui::theme`, built only from tokens, gets a row in the table above and a place in the gallery; then refresh the gallery images.
 - Screens never hard-code a colour or a size; if one is missing, it is missing from the tokens.

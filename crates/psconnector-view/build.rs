@@ -47,6 +47,13 @@ fn main() {
         }
         rs += "};\n\n";
     }
+    // every colour with its name, for the component gallery
+    let names: Vec<&str> = fields(&t["color"]["dark"]).into_iter().map(|(n, _)| n).collect();
+    writeln!(rs, "impl Tokens {{\n    /// Every colour token with its name, in tokens.json order.\n    pub fn named(&self) -> [(&'static str, Color32); {}] {{\n        [", names.len()).unwrap();
+    for n in &names {
+        writeln!(rs, "            ({n:?}, self.{n}),").unwrap();
+    }
+    rs += "        ]\n    }\n}\n\n";
     // sizes
     rs += "/// Sizes in points (design/tokens.json `size`).\npub mod size {\n";
     for (name, v) in fields(&t["size"]) {
