@@ -1,0 +1,81 @@
+/* PsConnector design tokens for web pages. Generated from design/tokens.json; do not edit.
+   Regenerate: UPDATE_DESIGN_TOKENS=1 cargo test -p psconnector-view tokens */
+:root {
+  --ps-accent: #2f6fe4;
+  --ps-accent-soft: #e6eefc;
+  --ps-accent-text: #1f55c0;
+  --ps-bg: #ffffff;
+  --ps-border: #e3e5e8;
+  --ps-danger: #d93a40;
+  --ps-danger-soft: #fdecec;
+  --ps-danger-text: #b42328;
+  --ps-faint: #8a909b;
+  --ps-hover: #eceef1;
+  --ps-muted: #5f6672;
+  --ps-raised: #ffffff;
+  --ps-success: #1f9d63;
+  --ps-success-soft: #e3f6ec;
+  --ps-success-text: #167a4c;
+  --ps-surface: #f6f7f9;
+  --ps-text: #14161a;
+  --ps-warning: #b7791f;
+  --ps-body: 13px;
+  --ps-caption: 12px;
+  --ps-control: 28px;
+  --ps-form: 32px;
+  --ps-gap: 8px;
+  --ps-heading: 20px;
+  --ps-icon: 16px;
+  --ps-label: 11px;
+  --ps-panel-pad: 16px;
+  --ps-panel-radius: 10px;
+  --ps-radius: 6px;
+  --ps-scroll-bar: 6px;
+  --ps-scroll-gap: 4px;
+  --ps-title: 15px;
+  --ps-font-text: "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ps-accent: #2f6fe4;
+    --ps-accent-soft: #17233a;
+    --ps-accent-text: #a9c4f8;
+    --ps-bg: #0e0f12;
+    --ps-border: #2a2e37;
+    --ps-danger: #d93a40;
+    --ps-danger-soft: #2a1517;
+    --ps-danger-text: #f0868a;
+    --ps-faint: #6b717c;
+    --ps-hover: #2a2e37;
+    --ps-muted: #9aa0ab;
+    --ps-raised: #1f2229;
+    --ps-success: #3dd68c;
+    --ps-success-soft: #133b29;
+    --ps-success-text: #7ee2b1;
+    --ps-surface: #16181d;
+    --ps-text: #e8eaed;
+    --ps-warning: #e2a93b;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --ps-accent: #2f6fe4;
+  --ps-accent-soft: #17233a;
+  --ps-accent-text: #a9c4f8;
+  --ps-bg: #0e0f12;
+  --ps-border: #2a2e37;
+  --ps-danger: #d93a40;
+  --ps-danger-soft: #2a1517;
+  --ps-danger-text: #f0868a;
+  --ps-faint: #6b717c;
+  --ps-hover: #2a2e37;
+  --ps-muted: #9aa0ab;
+  --ps-raised: #1f2229;
+  --ps-success: #3dd68c;
+  --ps-success-soft: #133b29;
+  --ps-success-text: #7ee2b1;
+  --ps-surface: #16181d;
+  --ps-text: #e8eaed;
+  --ps-warning: #e2a93b;
+  color-scheme: dark;
+}

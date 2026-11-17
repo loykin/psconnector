@@ -3,32 +3,13 @@
 //!
 //! Follows the system light / dark setting; the streaming window is dark by nature, so dark is the
 //! reference palette.
+//!
+//! The tokens (colours, sizes, icons) are defined once in `design/tokens.json` and generated into this module
+//! by build.rs; the rules for using them are in `design/README.md`.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, Response, RichText, Stroke, Theme, Ui, Visuals};
 
-/// Phosphor (regular) icon glyphs, from `assets/Phosphor.ttf`. Icons are text, so they take the text colour.
-pub mod icon {
-    pub const PLAY: &str = "\u{E3D0}";
-    pub const STOP: &str = "\u{E46C}";
-    pub const SLIDERS: &str = "\u{E434}";
-    pub const MORE: &str = "\u{E1FE}";
-    pub const SPEAKER: &str = "\u{E44A}";
-    pub const SPEAKER_OFF: &str = "\u{E45C}";
-    pub const GAMEPAD: &str = "\u{E26E}";
-    pub const PICTURE: &str = "\u{E18C}";
-    pub const CLOCK: &str = "\u{E19A}";
-    pub const RELOAD: &str = "\u{E036}";
-    pub const POWER: &str = "\u{E3DA}";
-    pub const DISCONNECT: &str = "\u{E42A}";
-    pub const WARNING: &str = "\u{E4E2}";
-    pub const USER: &str = "\u{E4C2}";
-    pub const CLOSE: &str = "\u{E4F6}";
-    pub const CONSOLE: &str = "\u{EAE6}";
-    pub const TRASH: &str = "\u{E4A6}";
-    pub const SAVE: &str = "\u{E248}";
-    pub const RECORD: &str = "\u{E3EE}";
-    pub const FLAG: &str = "\u{E244}";
-}
+include!(concat!(env!("OUT_DIR"), "/tokens.rs"));
 
 /// Embeds the icon font and puts it after the text font, so icons can be mixed into any label.
 pub fn add_icon_font(fonts: &mut egui::FontDefinitions) {
@@ -42,94 +23,6 @@ pub fn add_icon_font(fonts: &mut egui::FontDefinitions) {
         let at = keys.len().min(1);
         keys.insert(at, "phosphor".into());
     }
-}
-
-/// Colour tokens.
-pub struct Tokens {
-    /// window background (start screen)
-    pub bg: Color32,
-    /// bars and side panels
-    pub surface: Color32,
-    /// controls, menus, popovers
-    pub raised: Color32,
-    /// hovered or selected control
-    pub hover: Color32,
-    pub border: Color32,
-    pub text: Color32,
-    pub muted: Color32,
-    pub faint: Color32,
-    pub accent: Color32,
-    pub accent_soft: Color32,
-    pub accent_text: Color32,
-    pub danger: Color32,
-    pub danger_soft: Color32,
-    pub danger_text: Color32,
-    pub success: Color32,
-    pub success_soft: Color32,
-    pub success_text: Color32,
-    pub warning: Color32,
-}
-
-pub const DARK: Tokens = Tokens {
-    bg: Color32::from_rgb(0x0E, 0x0F, 0x12),
-    surface: Color32::from_rgb(0x16, 0x18, 0x1D),
-    raised: Color32::from_rgb(0x1F, 0x22, 0x29),
-    hover: Color32::from_rgb(0x2A, 0x2E, 0x37),
-    border: Color32::from_rgb(0x2A, 0x2E, 0x37),
-    text: Color32::from_rgb(0xE8, 0xEA, 0xED),
-    muted: Color32::from_rgb(0x9A, 0xA0, 0xAB),
-    faint: Color32::from_rgb(0x6B, 0x71, 0x7C),
-    accent: Color32::from_rgb(0x2F, 0x6F, 0xE4),
-    accent_soft: Color32::from_rgb(0x17, 0x23, 0x3A),
-    accent_text: Color32::from_rgb(0xA9, 0xC4, 0xF8),
-    danger: Color32::from_rgb(0xD9, 0x3A, 0x40),
-    danger_soft: Color32::from_rgb(0x2A, 0x15, 0x17),
-    danger_text: Color32::from_rgb(0xF0, 0x86, 0x8A),
-    success: Color32::from_rgb(0x3D, 0xD6, 0x8C),
-    success_soft: Color32::from_rgb(0x13, 0x3B, 0x29),
-    success_text: Color32::from_rgb(0x7E, 0xE2, 0xB1),
-    warning: Color32::from_rgb(0xE2, 0xA9, 0x3B),
-};
-
-pub const LIGHT: Tokens = Tokens {
-    bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-    surface: Color32::from_rgb(0xF6, 0xF7, 0xF9),
-    raised: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-    hover: Color32::from_rgb(0xEC, 0xEE, 0xF1),
-    border: Color32::from_rgb(0xE3, 0xE5, 0xE8),
-    text: Color32::from_rgb(0x14, 0x16, 0x1A),
-    muted: Color32::from_rgb(0x5F, 0x66, 0x72),
-    faint: Color32::from_rgb(0x8A, 0x90, 0x9B),
-    accent: Color32::from_rgb(0x2F, 0x6F, 0xE4),
-    accent_soft: Color32::from_rgb(0xE6, 0xEE, 0xFC),
-    accent_text: Color32::from_rgb(0x1F, 0x55, 0xC0),
-    danger: Color32::from_rgb(0xD9, 0x3A, 0x40),
-    danger_soft: Color32::from_rgb(0xFD, 0xEC, 0xEC),
-    danger_text: Color32::from_rgb(0xB4, 0x23, 0x28),
-    success: Color32::from_rgb(0x1F, 0x9D, 0x63),
-    success_soft: Color32::from_rgb(0xE3, 0xF6, 0xEC),
-    success_text: Color32::from_rgb(0x16, 0x7A, 0x4C),
-    warning: Color32::from_rgb(0xB7, 0x79, 0x1F),
-};
-
-/// Sizes in points.
-pub mod size {
-    /// controls in the bar and in popovers
-    pub const CONTROL: f32 = 28.0;
-    /// buttons and fields in forms (start screen)
-    pub const FORM: f32 = 32.0;
-    pub const RADIUS: u8 = 6;
-    pub const PANEL_RADIUS: u8 = 10;
-    pub const CAPTION: f32 = 12.0;
-    pub const BODY: f32 = 13.0;
-    pub const TITLE: f32 = 15.0;
-    pub const HEADING: f32 = 20.0;
-    /// padding inside side panels and cards
-    pub const PANEL_PAD: i8 = 16;
-    /// scroll bars: a thin bar in its own gutter, never over the content
-    pub const SCROLL_BAR: f32 = 6.0;
-    /// space between the content and the scroll bar
-    pub const SCROLL_GAP: f32 = 4.0;
 }
 
 pub fn tokens(ui: &Ui) -> &'static Tokens {
@@ -180,7 +73,7 @@ pub fn apply(ctx: &egui::Context) {
     for (theme, t, dark) in [(Theme::Light, &LIGHT, false), (Theme::Dark, &DARK, true)] {
         ctx.style_mut_of(theme, |s| {
             s.visuals = visuals(t, dark);
-            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            s.spacing.item_spacing = egui::vec2(size::GAP, size::GAP);
             s.spacing.button_padding = egui::vec2(10.0, 4.0);
             s.spacing.interact_size.y = size::CONTROL;
             s.spacing.menu_margin = Margin::same(6);
@@ -230,7 +123,7 @@ pub fn caption(ui: &Ui, text: impl Into<String>) -> RichText {
 /// Small upper-case label over a group of controls.
 pub fn section_label(ui: &mut Ui, text: &str) {
     let c = tokens(ui).muted;
-    ui.label(RichText::new(text.to_uppercase()).size(11.0).strong().color(c));
+    ui.label(RichText::new(text.to_uppercase()).size(size::LABEL).strong().color(c));
 }
 
 /// A tinted box for a problem the user can act on.
@@ -296,7 +189,7 @@ pub fn destructive(ui: &mut Ui, enabled: bool, text: &str) -> Response {
 
 /// A square icon-only button for the bar; the tooltip names it.
 pub fn icon_button(ui: &mut Ui, glyph: &str, tooltip: &str) -> Response {
-    let b = egui::Button::new(RichText::new(glyph).size(16.0))
+    let b = egui::Button::new(RichText::new(glyph).size(size::ICON))
         .frame_when_inactive(false)
         .min_size(egui::vec2(size::CONTROL, size::CONTROL))
         .corner_radius(CornerRadius::same(size::RADIUS));
@@ -368,7 +261,7 @@ pub fn badge(ui: &mut Ui, text: &str, tone: Tone) {
                 if let Some(c) = dot {
                     status_dot(ui, c);
                 }
-                ui.label(RichText::new(text).size(11.0).color(fg));
+                ui.label(RichText::new(text).size(size::LABEL).color(fg));
             });
         },
     );
@@ -386,7 +279,6 @@ pub fn vsep(ui: &mut Ui) {
     ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0, t.border));
 }
 
-/// A bordered panel with a title, used for the groups of the start screen.
 /// A side panel: fixed title row with a close button, then content that scrolls when the window is short.
 /// The panel's right padding holds the scroll bar, so the content and the title end at the same edge
 /// whether or not it scrolls. Returns true when the close button was pressed.
@@ -429,6 +321,7 @@ pub fn side_panel(
     closed
 }
 
+/// A bordered panel with a title, used for the groups of the start screen.
 pub fn card<R>(ui: &mut Ui, title: &str, description: Option<&str>, body: impl FnOnce(&mut Ui) -> R) -> R {
     let t = tokens(ui);
     egui::Frame::new()
@@ -446,4 +339,22 @@ pub fn card<R>(ui: &mut Ui, title: &str, description: Option<&str>, body: impl F
             body(ui)
         })
         .inner
+}
+
+#[cfg(test)]
+mod tests {
+    /// Web pages use design/tokens.css; it must be the CSS generated from design/tokens.json.
+    /// `UPDATE_DESIGN_TOKENS=1 cargo test -p psconnector-view tokens` rewrites it.
+    #[test]
+    fn web_tokens_are_generated_from_the_same_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../design/tokens.css");
+        if std::env::var_os("UPDATE_DESIGN_TOKENS").is_some() {
+            std::fs::write(&path, super::TOKENS_CSS).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            on_disk == super::TOKENS_CSS,
+            "design/tokens.css is out of date: run UPDATE_DESIGN_TOKENS=1 cargo test -p psconnector-view tokens"
+        );
+    }
 }

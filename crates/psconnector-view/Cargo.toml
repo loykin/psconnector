@@ -24,6 +24,10 @@ rayon = "1.11"
 serde_json.workspace = true
 tokio.workspace = true
 
+[build-dependencies]
+# design/tokens.json -> theme constants
+serde_json.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
