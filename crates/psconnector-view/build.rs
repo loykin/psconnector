@@ -125,4 +125,22 @@ fn main() {
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("tokens.rs");
     std::fs::write(out, rs).unwrap();
+
+    exe_icon(&manifest);
 }
+
+/// The icon of the .exe file itself (Explorer, taskbar pin, Alt-Tab); the window icon is set at run time.
+#[cfg(windows)]
+fn exe_icon(manifest: &std::path::Path) {
+    let ico = manifest.join("assets/icon.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon(ico.to_str().expect("path"));
+        res.compile().expect("cannot embed the .exe icon");
+    }
+}
+
+/// macOS shows an app icon through the .app bundle (scripts/macos-app.sh), not the executable.
+#[cfg(not(windows))]
+fn exe_icon(_manifest: &std::path::Path) {}

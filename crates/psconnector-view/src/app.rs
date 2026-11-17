@@ -220,7 +220,7 @@ impl eframe::App for App {
 }
 
 /// The window and Dock / taskbar icon (drawn by `assets/appicon.swift`).
-fn app_icon() -> Option<egui::IconData> {
+pub(crate) fn app_icon() -> Option<egui::IconData> {
     let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../assets/icon.png")));
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];

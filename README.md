@@ -269,6 +269,14 @@ cargo build --release
 
 This produces `psconnector-view` and `psconnector-mcp` in `target/release/`. Release builds are recommended because of video decoding.
 
+On Windows the `.exe` gets the app icon at build time. On macOS a plain executable has no icon in Finder or the Dock; make an app for it (icon, local network permission text, a launcher that runs this release build):
+
+```bash
+scripts/macos-app.sh            # ~/Desktop/PsConnector.app; or pass another folder
+```
+
+After changing the icon drawing (`crates/psconnector-view/assets/appicon.swift`), `scripts/make-icons.sh` regenerates `icon.png`, `icon.icns` and `icon.ico`.
+
 ## Setup
 
 Nothing else to install. Start `psconnector-view` without an address and its start screen walks through it:

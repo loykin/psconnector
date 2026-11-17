@@ -239,9 +239,15 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
 /// `psconnector-view --gallery`
 pub(crate) fn run() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("PsConnector · component gallery")
-            .with_inner_size([1100.0, 820.0]),
+        viewport: {
+            let v = egui::ViewportBuilder::default()
+                .with_title("PsConnector · component gallery")
+                .with_inner_size([1100.0, 820.0]);
+            match crate::app::app_icon() {
+                Some(icon) => v.with_icon(icon),
+                None => v,
+            }
+        },
         ..Default::default()
     };
     eframe::run_native(
