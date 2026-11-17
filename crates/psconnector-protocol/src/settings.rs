@@ -57,3 +57,13 @@ pub fn last_host() -> Option<String> {
 pub fn save_host(host: &str) {
     set("host", host.into());
 }
+
+/// Unique id (DDP host-id) of the console connected to last time: its address may change (DHCP), the id
+/// does not, so the start screen finds it again by this.
+pub fn last_host_id() -> Option<String> {
+    get("host_id").and_then(|v| v.as_str().map(str::to_string))
+}
+
+pub fn save_host_id(host_id: &str) {
+    set("host_id", host_id.into());
+}

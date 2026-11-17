@@ -4,9 +4,9 @@
 //! video (H.264 → RGB) and audio (Opus → 16-bit PCM, when `Options::audio` is on).
 //!
 //! ```no_run
-//! # async fn demo() -> psconnector::Result<()> {
+//! # async fn demo(ps5_address: &str) -> psconnector::Result<()> {
 //! use psconnector::{Button, Client};
-//! let client = Client::connect("192.0.2.10", Default::default()).await?;
+//! let client = Client::connect(ps5_address, Default::default()).await?;
 //! client.tap(Button::Cross, std::time::Duration::from_millis(80)).await;
 //! client.close().await;
 //! # Ok(()) }

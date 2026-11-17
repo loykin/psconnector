@@ -313,10 +313,16 @@ pub(crate) async fn wait_for_quit_signal() {
 /// so keep retrying long enough that a quality change does not fall back just before the console is ready.
 pub(crate) async fn connect(host: &str, opts: Options) -> Result<Client> {
     let t0 = Instant::now();
+    let mut attempt = 0;
     loop {
+        attempt += 1;
         match Client::connect(host, opts.clone()).await {
-            Ok(c) => return Ok(c),
+            Ok(c) => {
+                log::info!("connected to {host} on attempt {attempt}, {:.0} s", t0.elapsed().as_secs_f64());
+                return Ok(c);
+            }
             Err(e) if t0.elapsed() < Duration::from_secs(180) && is_transient(&e) => {
+                log::info!("connect to {host}: attempt {attempt} at {:.0} s: {e}", t0.elapsed().as_secs_f64());
                 println!("previous session still active ({e}), retrying in 3 s");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }

@@ -122,8 +122,7 @@ mod tests {
 
     #[test]
     fn window_options() {
-        let a =
-            window(&["192.0.2.10", "--port", "9000", "--run", "lap", "--for", "30", "--after", "standby"]).unwrap();
+        let a = window(&["192.0.2.10", "--port", "9000", "--run", "lap", "--for", "30", "--after", "standby"]).unwrap();
         assert_eq!(a.host.as_deref(), Some("192.0.2.10"));
         assert_eq!(a.port, 9000);
         assert_eq!(a.autorun.as_deref(), Some("lap"));

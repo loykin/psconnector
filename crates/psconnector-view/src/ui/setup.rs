@@ -48,6 +48,10 @@ pub struct Setup {
     /// Pairing with this console: (address, PIN typed so far)
     pair: Option<(String, String)>,
     busy: Option<String>,
+    /// Starting up: connect to the console with this id once the search finds it, else to this address
+    resume: Option<(Option<String>, Option<String>)>,
+    /// Id of the console being connected to, saved with its address once connected
+    connecting_id: Option<String>,
     error: Option<String>,
 }
 
@@ -104,7 +108,9 @@ fn open_browser(url: &str) {
 }
 
 impl Setup {
-    /// `host`: connect to this console right away (from the command line, or the last one used).
+    /// `host`: an address from the command line, connected to right away. Without one, the network is
+    /// searched and the console used last time is connected to at the address it has now (found by its
+    /// id); only if the search does not find it is its saved address tried.
     pub fn new(rt: tokio::runtime::Handle, opts: Options, host: Option<String>) -> Self {
         let (tx, rx) = channel();
         let mut s = Self {
@@ -120,11 +126,20 @@ impl Setup {
             login: None,
             pair: None,
             busy: None,
+            resume: None,
+            connecting_id: None,
             error: None,
         };
+        let saved = (psconnector_protocol::settings::last_host_id(), psconnector_protocol::settings::last_host());
         match host {
             Some(h) => s.connect(h),
-            None => s.search(),
+            None => {
+                if saved.0.is_some() || saved.1.is_some() {
+                    s.busy = Some("looking for the PS5 used last time...".into());
+                    s.resume = Some(saved);
+                }
+                s.search();
+            }
         }
         s
     }
@@ -180,9 +195,32 @@ impl Setup {
                     let _ = tx.send(Msg::Connected(Err(e)));
                     return;
                 }
+                // the console boots for 20-30 s; connect only once it reports itself on (as the official app
+                // does), not after a fixed wait, and give it a moment more to start its Remote Play service
+                let t0 = std::time::Instant::now();
+                let mut last = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let code = ddp::status(&addr).await.map(|s| s.code).unwrap_or(0);
+                    if code != last {
+                        log::info!("after wake-up: status {code} at {:.0} s", t0.elapsed().as_secs_f64());
+                        last = code;
+                    }
+                    if code == 200 {
+                        break;
+                    }
+                    if t0.elapsed() > Duration::from_secs(90) {
+                        let _ =
+                            tx.send(Msg::Connected(Err(format!("{addr} did not come on within 90 s of waking it"))));
+                        return;
+                    }
+                    let _ = tx.send(Msg::Note(format!(
+                        "waking {addr} from rest mode... {:.0} s",
+                        t0.elapsed().as_secs_f64()
+                    )));
+                }
                 let _ = tx.send(Msg::Note(format!("PS5 is on; connecting to {addr}...")));
-                // the console needs a few seconds after waking before it takes a session
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
             let r = crate::session::connect(&addr, opts).await.map(|c| (addr, c)).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Connected(r));
@@ -275,9 +313,20 @@ impl Setup {
                 for f in &found {
                     self.add_status(&f.addr.to_string(), &f.status, Some(f.name()));
                 }
+                if let Some((id, addr)) = self.resume.take() {
+                    // the console used last time, wherever it is now; its old address only if not found
+                    let here = id.and_then(|id| {
+                        found.iter().find(|f| f.status.host_id() == Some(id.as_str())).map(|f| f.addr.to_string())
+                    });
+                    match here.or(addr) {
+                        Some(a) => self.connect(a),
+                        None => self.busy = None,
+                    }
+                }
             }
             Msg::Status(addr, Ok(st)) => {
                 let (on, reg) = (st.is_on(), registered(st.host_id()));
+                self.connecting_id = st.host_id().map(str::to_string);
                 self.add_status(&addr, &st, None);
                 // a paired console in rest mode is being woken by connect()
                 if !reg {
@@ -335,6 +384,9 @@ impl Setup {
             Msg::Note(n) => self.busy = Some(n),
             Msg::Connected(Ok(c)) => {
                 psconnector_protocol::settings::save_host(&c.0);
+                if let Some(id) = &self.connecting_id {
+                    psconnector_protocol::settings::save_host_id(id);
+                }
                 return Some(c);
             }
             Msg::Connected(Err(e)) => {
@@ -540,7 +592,7 @@ impl Setup {
             let r = ui.add(
                 theme::field(&mut self.manual, theme::size::FORM)
                     .desired_width(w)
-                    .hint_text("Other PS5: address, e.g. 192.0.2.10"),
+                    .hint_text("Other PS5: its IP address"),
             );
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let can = idle && !self.manual.trim().is_empty();

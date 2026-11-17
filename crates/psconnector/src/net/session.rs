@@ -94,6 +94,14 @@ async fn request(sock: &mut TcpStream, host: &str, path: &str, headers: &[(&str,
 
 /// Rejection response → error. "Remote Play in use" gets its own variant (retrying shortly often works).
 fn rejection(stage: &str, resp: &Response) -> Error {
+    // what the console said, for comparing with other clients (header names and the reason only: the
+    // other values are keys and nonces)
+    let names: Vec<&str> = resp.headers.iter().map(|(k, _)| k.as_str()).collect();
+    log::info!(
+        "{stage} refused: HTTP {}, RP-Application-Reason {}, headers {names:?}",
+        resp.status,
+        resp.header("RP-Application-Reason").unwrap_or("-")
+    );
     let why = match resp.header("RP-Application-Reason") {
         Some(r) => match u32::from_str_radix(r, 16) {
             Ok(0x8010_8b10) => return Error::Busy,

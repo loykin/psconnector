@@ -64,8 +64,9 @@ pub(crate) fn run(args: Args) -> Result<()> {
         session::wait_for_quit_signal().await;
         QUIT.store(true, Ordering::SeqCst);
     });
-    // a console given on the command line, or else the one used last time, is connected to right away
-    let host = args.host.or_else(settings::last_host);
+    // an address given on the command line is connected to as it is; otherwise the start screen finds the
+    // console used last time by its id (its address may have changed) and connects to it
+    let host = args.host;
     let options = eframe::NativeOptions {
         viewport: {
             let v = egui::ViewportBuilder::default().with_title("PsConnector").with_inner_size([1280.0, 760.0]);

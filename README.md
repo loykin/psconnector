@@ -61,7 +61,7 @@ Internal modules:
 ```rust
 use psconnector::{Button, Client};
 
-let client = Client::connect("192.0.2.10", Default::default()).await?;
+let client = Client::connect(ps5_address, Default::default()).await?;
 client.tap(Button::Cross, std::time::Duration::from_millis(80)).await;
 // with Options { audio: true, .. }: client.take_audio() gives 10 ms chunks of 16-bit PCM
 if let Some(frame) = client.frame() {
@@ -73,11 +73,11 @@ client.close().await;
 Command-line tool for manual checks:
 
 ```bash
-cargo run -p psconnector --example rp -- 192.0.2.10 status
+cargo run -p psconnector --example rp -- <PS5-IP> status
 ```
 
 ```bash
-cargo run -p psconnector --example rp -- 192.0.2.10 tap right right
+cargo run -p psconnector --example rp -- <PS5-IP> tap right right
 ```
 
 It supports `discover`, `login`, `<host> register <PIN>`, `status`, `wake`, `connect [secs]`, `tap <button>...`, `snap [file]` and `standby`. Build with `--release`, because video decoding is slow in debug builds.
@@ -90,7 +90,7 @@ Shows the PS5 screen in a window and opens a command port for macros (127.0.0.1:
 cargo run --release -p psconnector-view
 ```
 
-Without an address it opens the start screen (or reconnects to the console used last time); `psconnector-view 192.0.2.10` connects to that console directly.
+Without an address it searches the network and reconnects to the console used last time, found by its id, so a changed address (DHCP) does not matter; `psconnector-view <PS5-IP>` connects to that address directly.
 
 | Command (one JSON object per line) | Reply |
 |---|---|
@@ -196,7 +196,7 @@ In the options button next to **▶** (the settings that change what **▶** doe
 When the limit is reached, a macro that checks `ps.should_stop()` gets 2 minutes to finish (for example the current lap) and exit; a macro that never checks it is stopped right away. The same options work from the command line and the command port:
 
 ```bash
-psconnector-view 192.0.2.10 --run "Code Vein" --for 180 --after standby --at 01:00
+psconnector-view --run "Code Vein" --for 180 --after standby --at 01:00
 ```
 
 ## Python macro interface (`python/psconnector.py`)
