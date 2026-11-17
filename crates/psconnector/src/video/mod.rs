@@ -21,6 +21,8 @@ use std::sync::Arc;
 use log::{debug, warn};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
+// rayon and the frame helpers below are only used by the macOS decoder path (`hw`) through `use super::*`
+#[cfg(target_os = "macos")]
 use rayon::prelude::*;
 use tokio::sync::watch;
 
@@ -42,6 +44,7 @@ mod vt;
 
 pub use color::VideoRange;
 pub(crate) use color::*;
+#[cfg(target_os = "macos")]
 pub(crate) use frame::*;
 pub use frame::{Frame, PixelFormat, hdr_sdr_curve};
 pub(crate) use stats::*;
