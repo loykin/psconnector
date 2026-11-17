@@ -4788,7 +4788,7 @@ dependencies = [
 
 [[package]]
 name = "psconnector"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4817,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "psconnector-mcp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4830,7 +4830,7 @@ dependencies = [
 
 [[package]]
 name = "psconnector-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "log",
  "png",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "psconnector-view"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "block2 0.6.2",

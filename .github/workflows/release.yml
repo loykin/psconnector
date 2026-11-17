@@ -21,17 +21,20 @@ jobs:
         with:
           fetch-depth: 0  # need full history to verify ancestry
 
-      - name: Validate tag format (vMAJOR.MINOR.PATCH) and Cargo version
+      # vMAJOR.MINOR.PATCH is a release; a suffix (v0.0.1-dev, v0.2.0-rc.1) makes a pre-release.
+      # Only the numbers have to match the workspace version in Cargo.toml.
+      - name: Validate tag format and Cargo version
         shell: bash
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag must match vMAJOR.MINOR.PATCH (e.g., v0.1.0). Given: $TAG"
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must be vMAJOR.MINOR.PATCH with an optional suffix (e.g., v0.1.0, v0.1.0-dev). Given: $TAG"
             exit 1
           fi
+          TAG_VERSION="${BASH_REMATCH[1]}"
           VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
-          if [ "v$VERSION" != "$TAG" ]; then
+          if [ "${VERSION%%-*}" != "$TAG_VERSION" ]; then
             echo "Tag $TAG does not match workspace version $VERSION in Cargo.toml"
             exit 1
           fi
@@ -145,6 +148,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             artifacts/*
         env:
