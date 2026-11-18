@@ -107,7 +107,12 @@ jobs:
           EXT=""
           if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; fi
           mkdir -p "$BASE/python" artifacts
-          cp "target/${{ matrix.target }}/release/psconnector-view${EXT}" "$BASE/"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # PsConnector.app carries the icon (a bare program cannot); it uses the macros folder beside it
+            scripts/macos-app.sh --release "target/${{ matrix.target }}/release/psconnector-view" "$BASE"
+          else
+            cp "target/${{ matrix.target }}/release/psconnector-view${EXT}" "$BASE/"
+          fi
           cp "target/${{ matrix.target }}/release/psconnector-mcp${EXT}" "$BASE/"
           cp README.md LICENSE "$BASE/"
           cp -R macros "$BASE/"

@@ -6,7 +6,7 @@ pub(crate) mod replay;
 
 use std::collections::VecDeque;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -99,16 +99,27 @@ pub(crate) struct MacroDef {
 
 /// Where macros are found when no `--macros` is given: the `macros` folder next to the program, so the whole
 /// folder can be moved (or unzipped anywhere on Windows) as one. A development build in `target/release/`
-/// uses the repository's `macros` folder instead.
+/// uses the repository's `macros` folder instead, and the macOS app (`PsConnector.app/Contents/MacOS/`) the
+/// folder next to the app.
 pub(crate) fn default_macro_sources() -> Vec<PathBuf> {
     let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let Some(dir) = exe.as_deref().and_then(|p| p.parent()) else { return vec![PathBuf::from("macros")] };
-    let beside = dir.join("macros");
+    let beside = match app_bundle(dir) {
+        Some(app) => app.parent().unwrap_or(app).join("macros"),
+        None => dir.join("macros"),
+    };
     let in_cargo_target = dir.parent().is_some_and(|p| p.file_name().is_some_and(|n| n == "target"));
     match dir.parent().and_then(|p| p.parent()) {
         Some(repo) if in_cargo_target && !beside.is_dir() => vec![repo.join("macros")],
         _ => vec![beside],
     }
+}
+
+/// The `X.app` folder when `dir` is an app's `X.app/Contents/MacOS`.
+fn app_bundle(dir: &Path) -> Option<&Path> {
+    let contents = dir.parent().filter(|_| dir.file_name().is_some_and(|n| n == "MacOS"))?;
+    let app = contents.parent().filter(|_| contents.file_name().is_some_and(|n| n == "Contents"))?;
+    app.extension().is_some_and(|e| e == "app").then_some(app)
 }
 
 /// Reads macros from each source: a folder holds one macro per subfolder (each with a `macro.json`),
@@ -652,6 +663,14 @@ pub(crate) fn interrupt(child: &mut Child) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_bundle_is_found_from_its_macos_folder() {
+        let dir = Path::new("/Users/me/Apps/PsConnector.app/Contents/MacOS");
+        assert_eq!(app_bundle(dir), Some(Path::new("/Users/me/Apps/PsConnector.app")));
+        assert_eq!(app_bundle(Path::new("/Users/me/psconnector")), None);
+        assert_eq!(app_bundle(Path::new("/Users/me/Other/Contents/MacOS")), None);
+    }
 
     fn runner_with(cmd: &str, after: &str) -> Runner {
         let list = vec![MacroDef {

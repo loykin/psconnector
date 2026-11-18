@@ -249,17 +249,17 @@ For example: "Look at the screen and tell me how to beat this boss", "Run the Co
 
 ## Download
 
-Prebuilt binaries for macOS (Apple Silicon and Intel) and Windows (x64) are attached to each [GitHub release](https://github.com/loykin/psconnector/releases). Each archive holds `psconnector-view`, `psconnector-mcp`, the example `macros/` folder and `python/psconnector.py`.
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Windows (x64) are attached to each [GitHub release](https://github.com/loykin/psconnector/releases). Each archive holds the viewer (`PsConnector.app` on macOS, `psconnector-view.exe` with the app icon on Windows), `psconnector-mcp`, the example `macros/` folder and `python/psconnector.py`. The macOS app uses the `macros/` folder next to it; its program is `PsConnector.app/Contents/MacOS/psconnector-view` for command-line options.
 
 On Windows, the `ocr` command is not supported yet (it uses macOS Vision); everything else works the same. Macros from the bar run through `cmd /C`.
 
-The binaries are not signed. Windows SmartScreen may warn on first run ("More info" → "Run anyway"). On macOS, clear the quarantine flag after extracting:
+The binaries are not signed with a paid developer certificate (the macOS app is signed ad hoc). Windows SmartScreen may warn on first run ("More info" → "Run anyway"). On macOS, clear the quarantine flag after extracting:
 
 ```bash
-xattr -d com.apple.quarantine psconnector-view psconnector-mcp
+xattr -dr com.apple.quarantine PsConnector.app psconnector-mcp
 ```
 
-CI (`.github/workflows/ci.yml`) runs rustfmt, clippy, build and tests on macOS and Windows, plus a RustSec dependency audit. Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag matching the workspace version in `Cargo.toml` is pushed on `master`.
+CI (`.github/workflows/ci.yml`) runs rustfmt, clippy, build and tests on macOS and Windows, plus a RustSec dependency audit. Releases are built by `.github/workflows/release.yml` when a tag is pushed on `master`: `vX.Y.Z` matching the workspace version in `Cargo.toml` makes a release, and a suffix (`v0.0.1-dev`, `v0.1.0-rc.1`) a pre-release.
 
 ## Build
 
