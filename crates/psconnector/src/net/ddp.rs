@@ -35,13 +35,29 @@ pub async fn status(host: &str) -> Result<Status> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     let msg = format!("SRCH * HTTP/1.1\ndevice-discovery-protocol-version:{VERSION}\n");
     let mut buf = [0u8; 2048];
-    for _ in 0..3 {
-        sock.send_to(msg.as_bytes(), (host, PORT_PS5)).await?;
-        if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(800), sock.recv_from(&mut buf)).await {
-            return parse(&buf[..n]);
+    // A failed send is tried again too: right after the computer or the console wakes, the first sends can
+    // fail with "No route to host" until the network has found the console (address lookup on the LAN).
+    let mut send_error = None;
+    for _ in 0..5 {
+        match sock.send_to(msg.as_bytes(), (host, PORT_PS5)).await {
+            Ok(_) => {
+                send_error = None;
+                if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_millis(800), sock.recv_from(&mut buf)).await
+                {
+                    return parse(&buf[..n]);
+                }
+            }
+            Err(e) => {
+                log::debug!("status request to {host}: {e}; trying again");
+                send_error = Some(e);
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
         }
     }
-    Err(Error::NoResponse { host: host.to_string() })
+    match send_error {
+        Some(e) => Err(e.into()),
+        None => Err(Error::NoResponse { host: host.to_string() }),
+    }
 }
 
 /// A console that answered a network-wide search.
