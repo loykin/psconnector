@@ -181,7 +181,12 @@ impl Gallery {
                     });
                     state(ui, "Running");
                     ui.horizontal(|ui| {
-                        bar::running_strip(ui, "Example macro", "00:01:28 · 28:32 left", "hand 7m 8m 9m … → discard N");
+                        bar::running_strip(
+                            ui,
+                            "Example macro",
+                            "00:01:28 · 28:32 left",
+                            "step 3 of 8 · waiting for the menu",
+                        );
                     });
                     state(ui, "Scheduled");
                     ui.horizontal(|ui| {

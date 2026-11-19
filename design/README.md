@@ -123,6 +123,8 @@ Each state colour comes as a trio: the solid colour (`danger`) for fills and dot
 
 ### The bar
 
+Every state of the macro widget below is drawn in the gallery (Macro widget section).
+
 - Order: **Picture** · divider · **macro widget** · (right) caption with controller and stream · quality · sound · **⋯**.
 - Everything is `control` (28) tall on the `surface` fill.
 - The macro widget is one control whose contents follow its state:
@@ -133,6 +135,8 @@ Each state colour comes as a trio: the solid colour (`danger`) for fills and dot
 - Rare or disruptive actions (reload list, disconnect, rest mode) live in **⋯**; rest mode is in `danger_text`.
 
 ### Side panel
+
+The gallery's right-hand column is a side panel.
 
 - 320 wide, `surface` fill, `panel_pad` padding.
 - The title row (title + close) and a caption stay fixed; the content scrolls.
